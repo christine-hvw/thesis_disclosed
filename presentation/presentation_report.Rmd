@@ -1,0 +1,79 @@
+---
+title: '"Predicting Covid-19 outbreaks using multi-layer centrality measures" <br>'
+subtitle: "*Presentation of the Research Report* <br>" 
+author: "Christine Hedde - von Westernhagen"
+date: '`r Sys.Date()` <br><br><br><br>
+  <img src="uu_logo.png" width="70px" height="70px" align="right"><br>
+  <span style = "font-size: 80%;">
+  *Master program MSBBSS, Department of Methodology and Statistics* </span>'
+output:
+  xaringan::moon_reader:
+    includes: 
+      after_body: insert-logo.html
+    chakra: libs/remark-latest.min.js
+    self_contained: true
+    lib_dir: libs
+    css: [default, metropolis, metropolis-fonts]
+    nature:
+      #slideNumberFormat: ""
+      ratio: 16:9
+---
+
+class: center, middle, inverse
+
+```{r setup, include=FALSE}
+options(htmltools.dir.version = FALSE)
+```
+
+# Let's break it down:
+
+---
+class: center, middle, inverse
+
+# **Predicting Covid-19 outbreaks** <span style = "color:gray";> using multi-layer centrality measures </span>
+
+---
+class: left, top
+
+## ***The relevance of my project***
+
+*Image/text related to Covid modeling*
+
+---
+class: center, middle, inverse
+
+# <span style = "color:gray";> Predicting Covid-19 outbreaks using </span> **multi-layer** <span style = "color:gray";> centrality measures </span>
+
+---
+class: left, top
+
+## ***The methodological framework: Multi-layer networks***
+
+*Image related to multi-layer network*
+
+---
+class: center, middle, inverse
+
+# <span style = "color:gray";> Predicting Covid-19 outbreaks using multi-layer  </span> **centrality measures**
+
+---
+class: left, top
+
+## ***The prediction method: Centrality measures***
+
+*Image related to centrality*
+
+---
+class: center, middle, inverse
+
+# Single-layer centrality **!=** Multi-layer centrality 
+
+---
+class: left, top
+
+*Images of collapsed and uncollapsed multi-layer, highlight central node*
+
+---
+class: center, middle, inverse
+
+# **Results so far**
