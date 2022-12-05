@@ -12,11 +12,12 @@ library(here)
 library(tidyverse)
 library(muxViz)
 library(ggplot2)
-library(ggraph)
 library(igraph)
+library(Matrix)
 library(rgl)      # output 3d plots
 library(tidytext) # ordering factors within facets
 library(ggsankey) # sankey diagrams
+library(patchwork)
 ```
 
 # Data prep
@@ -43,14 +44,14 @@ nodes[!nodes$node_id %in%  unique(c(edges$source, edges$target)),]
 
 Example code if sampling is necessary.
 
-```{r}
+```{r, eval = FALSE}
 child_edges <- edges[edges$edgetype == "child",]
 
 child_nodes <-  child_edges["source"]
 
 keep_relations <- c("child", "parent", "sibling")
 
-# sampling
+# sampling, e.g., 30% of children
 sample_frac <- 0.3
 pop_size <- nrow(child_nodes)
 
@@ -75,7 +76,7 @@ g_all <- graph_from_data_frame(d = edges[, c("source", "target")],
 ```{r}
 # Make multi-layer network
 groups <- unique(edges$edgetype)
-layers <- 5 # (after collapsing family categories)
+layers <- 4 # (after collapsing family categories)
 obs <- nrow(nodes)
 
 node_tensor <- list()
@@ -91,7 +92,7 @@ for (g in groups) {
 
 
 # collapse corresponding categories into "family"
-family <-  c('aunt / uncle', 'neighbor', 'cousin', 'mother / father-in-law', 'sibling',  'grandchild', 'grandparent',  'niece / nephew', 'parent', 'sister / brother-in-law',  'child', 'daughter / son-in-law')
+family <-  c('aunt / uncle', 'neighbor', 'cousin', 'mother / father-in-law', 'sibling',  'grandchild', 'grandparent',  'niece / nephew', 'parent', 'sister / brother-in-law',  'child', 'daughter / son-in-law', 'partner')
 
 graph_fam <- graph_from_data_frame(d = edges[edges$edgetype %in% family, c("source", "target")],
                                    # include ALL vertices
@@ -104,8 +105,10 @@ g_list <- g_list[!names(g_list) %in% family]
 node_tensor <- node_tensor[!names(node_tensor) %in% family]
 
 # Define layer tensor
-layer_tensor <- Matrix(1, 5, 5, sparse = TRUE, doDiag = FALSE)
-diag(layer_tensor) <- FALSE
+layer_tensor <- Matrix(c(0,1,1,1,
+                         1,0,1,1,
+                         1,1,0,1,
+                         1,1,1,0) , nrow = 4, sparse = TRUE)
 
 # Build supra-adjacency matrix
 M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor, layers, obs)
@@ -127,11 +130,12 @@ heatmap(as.matrix(M), Rowv = NA, Colv = NA, useRaster = TRUE,
 ```
 
 ```{r}
+set.seed(789)
 lay <- layoutMultiplex(g_list, layout = "comp", box = TRUE)
 
 plot_multiplex3D(g_list,
-  layer.layout = lay, layer.colors = c(2:6),
-  layer.shift.x = 0.5, layer.space = 2,
+  layer.layout = lay, layer.colors = c(2:5),
+  layer.shift.x = 0.3, layer.space = 2,
   layer.scale = 2.2, layer.alpha = rep(.2, length(g_list)),
   layer.labels = names(g_list), layer.labels.cex = 1,
   node.size.values = 6,
@@ -146,7 +150,6 @@ knitr::include_graphics("3dplot_dummy.png")
 # Explore multi vs. single-layer centralities
 
 ```{r, fig.width=4, fig.height=5, warning=FALSE}
-
 plot_centrality_ranking <- function(type, single, multi, node_ids) {
   
   df <- data.frame("single" = single, "multi" = multi) %>% 
@@ -171,25 +174,29 @@ plot_centrality_ranking <- function(type, single, multi, node_ids) {
   
   ggplot(sankey_dat, aes(x = x, next_x = next_x, node = node, next_node = next_node,
                          fill = node, label = node)) +
-    geom_sankey(flow.alpha = .6) +
-    geom_sankey_text(size = 3) +
+    geom_sankey(flow.alpha = .6, space = 1.5, width = 0.15) +
+    geom_sankey_label(size = 2.2, color = "black", fill = "white", space = 1.5, alpha = 0.8) +
     theme_sankey() +
-    scale_fill_viridis_b() +
-    theme(legend.position = "none")
+    scale_fill_viridis_c(option = "plasma") +
+    scale_x_discrete(labels = c("single" = "Single-layer", "multi" = "Multi-layer")) +
+    labs(x = type, y = "Node rank", fill = "Node rank") +
+    coord_cartesian(xlim = c(1.4, 2)) +
+    theme(legend.position = c(.83, .5), 
+          axis.title.x = element_text(hjust = 0.35))
   
 }
 
 # Degree
 deg_single <- degree(g_all)
-deg_mult <- c(GetMultiDegree(M, layers, obs, isDirected = FALSE))
+deg_mult <- c(GetMultiDegreeSum(M, layers, obs, isDirected = FALSE))
 
-plot_centrality_ranking("degree", deg_single, deg_mult, nodes$node_id)
+plt_deg <- plot_centrality_ranking("Degree centrality", deg_single, deg_mult, nodes$node_id)
 
 # Eigenvector
 eig_single <- eigen_centrality(g_all)$vector
 eig_mult <- c(GetMultiEigenvectorCentrality(M, layers, obs))
 
-plot_centrality_ranking("eigenvector", eig_single, eig_mult, nodes$node_id)
+plt_eig <- plot_centrality_ranking("Eigenvector centrality", eig_single, eig_mult, nodes$node_id)
 
 # k-core
 # deg_single <- degree(g_all)
@@ -201,6 +208,20 @@ plot_centrality_ranking("eigenvector", eig_single, eig_mult, nodes$node_id)
 pr_single <- page_rank(g_all)$vector
 pr_mult <- c(GetMultiPageRankCentrality(M, layers, obs))
 
-plot_centrality_ranking("pagerank", pr_single, pr_mult, nodes$node_id)
+plt_pr <- plot_centrality_ranking("PageRank centrality", pr_single, pr_mult, nodes$node_id)
 
+# Closeness
+clo_single <- closeness(g_all)
+clo_mult <- GetMultiClosenessCentrality(M, layers, obs)[[1]]
+
+plt_clo <- plot_centrality_ranking("Closeness centrality", clo_single, clo_mult, nodes$node_id)
+```
+
+
+```{r, fig.width=8, fig.height=10, warning=FALSE}
+(plt_deg + plt_eig) /
+  (plt_pr + plt_clo) 
+
+ggsave(here("analyses/sankeyplot_dummy.png"), dpi = 600,
+       width = 8, height = 10)
 ```
