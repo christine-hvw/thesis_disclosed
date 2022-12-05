@@ -218,10 +218,9 @@ plt_clo <- plot_centrality_ranking("Closeness centrality", clo_single, clo_mult,
 ```
 
 
-```{r, fig.width=8, fig.height=10, warning=FALSE}
-(plt_deg + plt_eig) /
-  (plt_pr + plt_clo) 
+```{r, fig.width=8, fig.height=5, warning=FALSE}
+plt_eig + plt_pr
 
 ggsave(here("analyses/sankeyplot_dummy.png"), dpi = 600,
-       width = 8, height = 10)
+       width = 8, height = 5)
 ```
