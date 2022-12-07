@@ -2,10 +2,10 @@
 title: '"Predicting Covid-19 outbreaks using multi-layer centrality measures" <br>'
 subtitle: "*Presentation of the Research Report* <br>" 
 author: "Christine Hedde - von Westernhagen"
-date: '`r Sys.Date()` <br><br><br><br>
+date: '14-12-2022 <br><br><br><br>
   <img src="uu_logo.png" width="70px" height="70px" align="right"><br>
   <span style = "font-size: 80%;">
-  *Master program MSBBSS, Department of Methodology and Statistics* </span>'
+  *Master program MSBBSS, Department of Methodology and Statistics, Utrecht University* </span>'
 output:
   xaringan::moon_reader:
     includes: 
@@ -49,7 +49,8 @@ class: left, top
 
 ## ***The methodological framework: Multi-layer networks***
 
-*Image related to multi-layer network*
+<img src="3dplot_dummy.png" style="height:450px; width:700px; object-fit:cover; border:5px white; margin:15px 0px 0px 200px">
+
 
 ---
 class: center, middle, inverse
@@ -76,4 +77,11 @@ class: left, top
 ---
 class: center, middle, inverse
 
-# **Results so far**
+# **Preliminary Results**
+
+---
+class: center
+
+### *Ranking nodes: Single-layer vs. Multi-layer centrality*
+
+<img src="sankeyplot_dummy.png" style=" width:750px; object-fit:cover; border:5px white; margin:0px 0px 0px 0px">
