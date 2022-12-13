@@ -92,7 +92,7 @@ class: left, top
 <p style="margin:-400px 0px 0px 800px"> 
 <b> CBS micro-data </b> allows to construct multi-layer network data set. <br><br> 
 Micro-data can be linked to <b> PCR test data. </b> <br><br> 
-Analyses conducted on regional <b> sample </b> of elementary schools.
+Analyses conducted on regional <b> sample </b>.
 </p>
 
 ---
@@ -168,35 +168,20 @@ class: center
 
 <img src="img/sankeyplot_dummy.png" style=" width:750px; object-fit:cover; border:5px white; margin:0px 0px 0px 0px">
 
----
-class: center, middle, inverse
-
-# **Conclusion**
 
 ---
 class: top, left
 
-.pull-left[
+## What is **next**:
+<br>
 
-## What we know **so far:** 
+> ### 1. **Simulate** outbreak
+> ### 2. **Predict** time point of infection with multi-layer measures
+> ### 3. **Optimize** prediction in a newly created measure
+> ### 4. **Test** performance of new measure under different epidemic scenarios
 
-### Spreading properties of single-layer and multi-layer networks differ - Preliminary results **support** that.
-
-### Multi-layer centrality measures account for complex structure (De Domenico et al. 2015).
-]
 
 --
-
-.pull-right[
-
-
-## What is **next**:
-
-
-### 1. Simulate outbreak
-### 2. Predict time point of infection with centrality measure
-### 3. Optimize prediction in a newly created measure
-### 4. Test performance of new measure under different epidemic scenarios
-
-]
+<br>
+## *5. Tell you what I found!*
 
