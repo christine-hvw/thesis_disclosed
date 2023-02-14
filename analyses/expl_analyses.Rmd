@@ -116,6 +116,8 @@ M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor,
 
 # Explore multi-layer network
 
+## Heatmap
+
 ```{r, fig.height=7, fig.width=7}
 #rotate <- function(mat) t(mat[nrow(mat):1, ,drop = FALSE])
 
@@ -128,6 +130,8 @@ heatmap(as.matrix(M), Rowv = NA, Colv = NA, useRaster = TRUE,
         col = hcl.colors(100), revC = TRUE,
         labRow = rep(1:nrow(nodes), layers), labCol = rep(1:nrow(nodes), layers))
 ```
+
+## 3D plot
 
 ```{r}
 set.seed(789)
@@ -148,6 +152,24 @@ knitr::include_graphics("3dplot_dummy.png")
 ```
 
 # Explore multi vs. single-layer centralities
+
+## Compute centralities
+
+```{r}
+deg_single <- degree(g_all)
+deg_mult <- c(GetMultiDegreeSum(M, layers, obs, isDirected = FALSE))
+
+eig_single <- eigen_centrality(g_all)$vector
+eig_mult <- c(GetMultiEigenvectorCentrality(M, layers, obs))
+
+pr_single <- page_rank(g_all)$vector
+pr_mult <- c(GetMultiPageRankCentrality(M, layers, obs))
+
+clo_single <- closeness(g_all)
+clo_mult <- GetMultiClosenessCentrality(M, layers, obs)[[1]]
+```
+
+## Compare node ranking
 
 ```{r, fig.width=4, fig.height=5, warning=FALSE}
 plot_centrality_ranking <- function(type, single, multi, node_ids, yaxis_title = TRUE) {
@@ -188,33 +210,15 @@ plot_centrality_ranking <- function(type, single, multi, node_ids, yaxis_title =
 }
 
 # Degree
-deg_single <- degree(g_all)
-deg_mult <- c(GetMultiDegreeSum(M, layers, obs, isDirected = FALSE))
-
 plt_deg <- plot_centrality_ranking("Degree centrality", deg_single, deg_mult, nodes$node_id)
 
 # Eigenvector
-eig_single <- eigen_centrality(g_all)$vector
-eig_mult <- c(GetMultiEigenvectorCentrality(M, layers, obs))
-
 plt_eig <- plot_centrality_ranking("Eigenvector centrality", eig_single, eig_mult, nodes$node_id, yaxis_title = FALSE)
 
-# k-core
-# deg_single <- degree(g_all)
-# deg_mult <- c(GetMultiDegree(M, layers, obs, isDirected = F))
-# 
-# plot_centrality_ranking("degree", deg_single, deg_mult, nodes$node_id)
-
 # PageRank
-pr_single <- page_rank(g_all)$vector
-pr_mult <- c(GetMultiPageRankCentrality(M, layers, obs))
-
 plt_pr <- plot_centrality_ranking("PageRank centrality", pr_single, pr_mult, nodes$node_id)
 
 # Closeness
-clo_single <- closeness(g_all)
-clo_mult <- GetMultiClosenessCentrality(M, layers, obs)[[1]]
-
 plt_clo <- plot_centrality_ranking("Closeness centrality", clo_single, clo_mult, nodes$node_id, yaxis_title = FALSE)
 ```
 
@@ -237,4 +241,99 @@ plt_eig + plt_pr
 ggsave(here("analyses/sankeyplot_eig-pr.png"), dpi = 600,
        width = 8.2, height = 5)
 ```
+
+
+# Epidemic modeling
+
+**Function for SIR network model**
+
+Similar to [`epimdr::NetworkSIR()`](https://github.com/objornstad/epimdr/blob/master/rcode/chapter12code.r), [Book link](https://link.springer.com/chapter/10.1007/978-3-319-97487-3_12).
+
+```{r}
+model_sir_multiplex <- function(adj_mats, tau, gamma, seed_infs = 1, 
+                                random_seed = 789, t_max = Inf) {
+  #adj_mats = list of separate adj. mats. per layer (= node tensor)
+  #tau  =  vector of probabilities of infection across an edge in each layer
+  #gamma  =  recovery time (not layer specific)
+  #seed_infs = no. of infected seed nodes
+  #random_seed = seed for sampling seed nodes (lol)
+  #t_max = max. no. of time steps
+  
+  layers <- length(adj_mats)
+  N <- dim(adj_mats[[1]])[1]
+  S <- matrix(rep(1, N), nrow = N, ncol = 1) #First susceptibles (all)
+  I <- matrix(rep(0, N), nrow = N, ncol = 1) #First infecteds 
+  R <- matrix(rep(0, N), nrow = N, ncol = 1) #First removed 
+  
+  # sample seed infection(s)
+  set.seed(random_seed)
+  I1 <- sample(1:N, size = seed_infs)
+  # change status of seed nodes
+  S[I1,1] <- 0
+  I[I1,1] <- 1
+  
+  # storage for new infections per layer
+  newI_layers <- vector(mode = "list", length = layers)
+  
+  # while there are still infecteds (=not recovered) & t is smaller than t_max...
+  t <- 1
+  while(sum(I[,t]) > 0 & t < t_max) {
+    
+    t <- t + 1
+    
+    for(l in 1:layers) {
+      # vector of infection status neighbors
+      infneigh <- adj_mats[[l]] %*% I[,t-1]
+      # prob. of infection along each edge (Reed-Frost model)
+      pinf <- as.vector(1 - (1 - tau[l])^infneigh)
+    
+      # create new infections based on pinf in layer
+      newI_layers[[l]] <- rbinom(N, S[,t-1], pinf)
+    }
+    
+    # get union of infections across layers
+    # -> if infected in one layer, you're infected in all layers
+    newI <- as.integer(apply(do.call("cbind", newI_layers), 1, sum) > 0)
+    
+    # create new recoveries based on inf.time == gamma
+    if(t > gamma) {
+      newR <- as.integer(rowSums(I[,c((t-gamma):(t-1))]) == gamma)
+    } else {
+      newR <- R[,t-1]
+    }
+    
+    # update groups for next time step
+    nextS <- S[,t-1] - newI
+    nextI <- I[,t-1] + newI - newR
+    nextR <- R[,t-1] + newR
+    
+    # collect old and new observations for each group
+    I <- cbind(I, nextI)
+    S <- cbind(S, nextS)
+    R <- cbind(R, nextR)
+  }
+  
+  res <- list(I = I, S = S, R = R)
+  return(res)
+}
+```
+
+
+```{r}
+sir_res <- model_sir_multiplex(adj_mats = node_tensor, 
+                               tau = c(.3, .1, .2, .3), gamma = 7, 
+                               seed_infs = 1, random_seed = 789, t_max = Inf)
+
+{plot(apply(sir_res$S,2,sum), type = "l", xlab = "Time", 
+     ylab = "Count")
+lines(apply(sir_res$I,2,sum), type = "l", col = "red")
+lines(apply(sir_res$R,2,sum), type = "l", col = "blue")
+legend(x = 0.5, y = 120, 
+       legend = c("Susceptible", "Infected", "Recovered"), 
+       lty = 1, bg = "transparent", bty = "n",
+       col=c("black", "red", "blue"))}
+
+```
+
+
 
