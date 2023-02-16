@@ -493,3 +493,17 @@ lapply(list(sir_res_all1, sir_res_all2), function(x) {
             sd = sd(value))
 })
 ```
+
+```{r}
+lapply(list(sir_res_all1, sir_res_all2), function(x) {
+  x %>% 
+    group_by(sim_no) %>% 
+    mutate(duration = max(step)) %>% 
+    ungroup() %>% 
+    summarise(duration_mean = mean(duration),
+              duration_min = min(duration),
+              duration_max = max(duration),
+              duration_sd = sd(duration))
+})
+```
+
