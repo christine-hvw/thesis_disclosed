@@ -250,11 +250,12 @@ ggsave(here("analyses/sankeyplot_eig-pr.png"), dpi = 600,
 Similar to [`epimdr::NetworkSIR()`](https://github.com/objornstad/epimdr/blob/master/rcode/chapter12code.r), [Book link](https://link.springer.com/chapter/10.1007/978-3-319-97487-3_12).
 
 ```{r}
-model_sir_multiplex <- function(adj_mats, tau, gamma, seed_infs = 1, 
-                                random_seed = 789, t_max = Inf) {
+model_sir_multiplex <- function(adj_mats, tau, gamma, r_stochastic = "individual",
+                                seed_infs = 1, random_seed = 789, t_max = Inf) {
   #adj_mats = list of separate adj. mats. per layer (= node tensor)
   #tau  =  vector of probabilities of infection across an edge in each layer
   #gamma  =  recovery time (not layer specific)
+  #r_stochastic = is recovery stochastic on the individual level or per simulation?
   #seed_infs = no. of infected seed nodes
   #random_seed = seed for sampling seed nodes (lol)
   #t_max = max. no. of time steps
@@ -266,11 +267,15 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, seed_infs = 1,
   R <- matrix(rep(0, N), nrow = N, ncol = 1) #First removed 
   
   # sample seed infection(s)
-  set.seed(random_seed)
+  if(!is.null(random_seed)) set.seed(random_seed)
+  
   I1 <- sample(1:N, size = seed_infs)
   # change status of seed nodes
   S[I1,1] <- 0
   I[I1,1] <- 1
+  
+  # if true, set recovery time sampled from Weibull distribution per simulation
+  if(r_stochastic == "simulation") rec_time <- ceiling(rweibull(1, scale = gamma, shape = 1))
   
   # storage for new infections per layer
   newI_layers <- vector(mode = "list", length = layers)
@@ -295,12 +300,29 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, seed_infs = 1,
     # -> if infected in one layer, you're infected in all layers
     newI <- as.integer(apply(do.call("cbind", newI_layers), 1, sum) > 0)
     
-    # create new recoveries based on inf.time == gamma
-    if(t > gamma) {
-      newR <- as.integer(rowSums(I[,c((t-gamma):(t-1))]) == gamma)
-    } else {
+    # deterministic approach: create new recoveries based on inf.time == gamma
+    # if(t > gamma) {
+    #   newR <- as.integer(rowSums(I[,c((t-gamma):(t-1))]) == gamma)
+    # } else {
+    #   newR <- R[,t-1]
+    # }
+    
+    # create new recoveries based on Weibull distributed recovery time
+    if(r_stochastic == "individual") {
+      
+      inf_days <- rowSums(I)
+      R_prob <- pweibull(inf_days, scale = gamma, shape = 1)
+      newR <- rbinom(N, I[,t-1], R_prob)
+      
+    } else if(r_stochastic == "simulation" & t > rec_time) {
+      
+      newR <- as.integer(rowSums(as.matrix(I[,(t-rec_time):(t-1)]) >= rec_time))
+      
+    } else if(r_stochastic == "simulation" & t <= rec_time) {
+      
       newR <- R[,t-1]
-    }
+    
+    } else {stop("r_stochastic must be either 'individual' or 'simulation'")}
     
     # update groups for next time step
     nextS <- S[,t-1] - newI
@@ -318,22 +340,146 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, seed_infs = 1,
 }
 ```
 
+Test function.
 
 ```{r}
-sir_res <- model_sir_multiplex(adj_mats = node_tensor, 
-                               tau = c(.3, .1, .2, .3), gamma = 7, 
-                               seed_infs = 1, random_seed = 789, t_max = Inf)
+sir_res_sim <- model_sir_multiplex(adj_mats = node_tensor, 
+                                   tau = c(.3, .1, .2, .3), gamma = 5, r_stochastic = "simulation",
+                                   seed_infs = 1, random_seed = 6, t_max = Inf)
 
-{plot(apply(sir_res$S,2,sum), type = "l", xlab = "Time", 
-     ylab = "Count")
-lines(apply(sir_res$I,2,sum), type = "l", col = "red")
-lines(apply(sir_res$R,2,sum), type = "l", col = "blue")
+{plot(apply(sir_res_sim$S,2,sum), type = "l", xlab = "Time", ylab = "Count")
+lines(apply(sir_res_sim$I,2,sum), type = "l", col = "red")
+lines(apply(sir_res_sim$R,2,sum), type = "l", col = "blue")
 legend(x = 0.5, y = 120, 
        legend = c("Susceptible", "Infected", "Recovered"), 
        lty = 1, bg = "transparent", bty = "n",
        col=c("black", "red", "blue"))}
 
+sir_res_idv <- model_sir_multiplex(adj_mats = node_tensor, 
+                                   tau = c(.3, .1, .2, .3), gamma = 5, r_stochastic = "individual",
+                                   seed_infs = 1, random_seed = 123, t_max = Inf)
+
+{plot(apply(sir_res_idv$S,2,sum), type = "l", xlab = "Time", ylab = "Count")
+lines(apply(sir_res_idv$I,2,sum), type = "l", col = "red")
+lines(apply(sir_res_idv$R,2,sum), type = "l", col = "blue")
+legend(x = 0.5, y = 120, 
+       legend = c("Susceptible", "Infected", "Recovered"), 
+       lty = 1, bg = "transparent", bty = "n",
+       col=c("black", "red", "blue"))}
 ```
 
+Run k simulations and collect results in one data frame for plotting.
+
+- Simulation based recovery time
+
+```{r}
+sir_res1 <- lapply(1:500, function(x) {
+  model_sir_multiplex(adj_mats = node_tensor, 
+                      tau = c(.3, .1, .2, .3), gamma = 5, r_stochastic = "simulation",
+                      seed_infs = 1, random_seed = NULL, t_max = 100)
+  }
+)
+
+sir_res_sum1 <- lapply(1:500, function(x) {
+  lapply(sir_res1[[x]], colSums)
+  }
+)
+
+sir_res_df1 <- lapply(sir_res_sum1, function(x) {
+  df <- as.data.frame(do.call("rbind", x)) 
+  steps <- ncol(df)
+  df %>%
+    `colnames<-`(1:steps) %>% 
+    rownames_to_column("status") %>% 
+    pivot_longer(cols = -1, names_to = "step", values_to = "value") %>% 
+    mutate(step = as.integer(step))
+  }
+)
+
+sir_res_df1 <- lapply(1:500, function(x) mutate(sir_res_df1[[x]], sim_no = x))
+
+sir_res_all1 <- do.call("rbind", sir_res_df1) %>% 
+  group_by(status, step) %>% 
+  mutate(mean = mean(value),
+         sd = sd(value), 
+         upper = mean + 2*sd,
+         lower = mean - 2*sd)
+
+  
+```
+
+- Individual based recovery time
+
+```{r}
+sir_res2 <- lapply(1:500, function(x) {
+  model_sir_multiplex(adj_mats = node_tensor, 
+                      tau = c(.3, .1, .2, .3), gamma = 5, r_stochastic = "individual",
+                      seed_infs = 1, random_seed = NULL, t_max = Inf)
+  }
+)
+
+sir_res_sum2 <- lapply(1:500, function(x) {
+  lapply(sir_res2[[x]], colSums)
+  }
+)
+
+sir_res_df2 <- lapply(sir_res_sum2, function(x) {
+  df <- as.data.frame(do.call("rbind", x)) 
+  steps <- ncol(df)
+  df %>%
+    `colnames<-`(1:steps) %>% 
+    rownames_to_column("status") %>% 
+    pivot_longer(cols = -1, names_to = "step", values_to = "value") %>% 
+    mutate(step = as.integer(step))
+  }
+)
+
+sir_res_df2 <- lapply(1:500, function(x) mutate(sir_res_df2[[x]], sim_no = x))
+
+sir_res_all2 <- do.call("rbind", sir_res_df2) %>% 
+  group_by(status, step) %>% 
+  mutate(mean = mean(value),
+         sd = sd(value), 
+         upper = mean + 2*sd,
+         lower = mean - 2*sd)
+
+  
+```
+
+Plot count of nodes in respective status for each simulation. Compare individual- and simulation-based recovery time.
+
+```{r, fig.width=9}
+ggplot(sir_res_all1, aes(x = step, y = value)) +
+  geom_line(aes(color = as.factor(status), group = sim_no),
+            alpha = .2, linewidth = .5) +
+  facet_wrap(~ status) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_light() +
+  theme(legend.position = "none")
+
+ggplot(sir_res_all2, aes(x = step, y = value)) +
+  geom_line(aes(color = as.factor(status), group = sim_no),
+            alpha = .2, linewidth = .5) +
+  facet_wrap(~ status) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_light() +
+  theme(legend.position = "none")
+```
+
+-> When recovery time is sampled once per simulation for all individuals, some epidemics don't end (at least not within 100 days).
+
+-> When recovery time is sampled per individual based on infection duration, some epidemics end very quickly.
 
 
+Also get compare descriptive statistics.
+
+```{r}
+lapply(list(sir_res_all1, sir_res_all2), function(x) {
+  x %>% 
+  group_by(status) %>% 
+  summarise(mean = mean(value),
+            min = min(value),
+            max = max(value),
+            sd = sd(value))
+})
+```
