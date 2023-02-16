@@ -476,10 +476,7 @@ ggplot(sir_res_all2, aes(x = step, y = value)) +
   theme(legend.position = "none")
 ```
 
--> When recovery time is sampled once per simulation for all individuals, some epidemics don't end (at least not within 100 days).
-
--> When recovery time is sampled per individual based on infection duration, some epidemics end very quickly.
-
+-> When recovery time is sampled once per simulation for all individuals, variation in length and intensity of the epidemic is larger.
 
 Also get compare descriptive statistics.
 
