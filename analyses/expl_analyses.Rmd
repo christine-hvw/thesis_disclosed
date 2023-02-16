@@ -275,7 +275,11 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, r_stochastic = "individual
   I[I1,1] <- 1
   
   # if true, set recovery time sampled from Weibull distribution per simulation
-  if(r_stochastic == "simulation") rec_time <- ceiling(rweibull(1, scale = gamma, shape = 1))
+  if(r_stochastic == "simulation") {
+    rec_time <- ceiling(rweibull(1, scale = gamma, shape = 1))
+    } else { 
+    rec_time <- "individual"
+  }
   
   # storage for new infections per layer
   newI_layers <- vector(mode = "list", length = layers)
@@ -316,7 +320,7 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, r_stochastic = "individual
       
     } else if(r_stochastic == "simulation" & t > rec_time) {
       
-      newR <- as.integer(rowSums(as.matrix(I[,(t-rec_time):(t-1)]) >= rec_time))
+      newR <- as.integer(rowSums(as.matrix(I[,c((t-rec_time):(t-1))])) >= rec_time)
       
     } else if(r_stochastic == "simulation" & t <= rec_time) {
       
@@ -335,7 +339,7 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, r_stochastic = "individual
     R <- cbind(R, nextR)
   }
   
-  res <- list(I = I, S = S, R = R)
+  res <- list(I = I, S = S, R = R, rec_time = rec_time)
   return(res)
 }
 ```
@@ -381,7 +385,7 @@ sir_res1 <- lapply(1:500, function(x) {
 )
 
 sir_res_sum1 <- lapply(1:500, function(x) {
-  lapply(sir_res1[[x]], colSums)
+  lapply(sir_res1[[x]][1:3], colSums)
   }
 )
 
@@ -396,14 +400,20 @@ sir_res_df1 <- lapply(sir_res_sum1, function(x) {
   }
 )
 
-sir_res_df1 <- lapply(1:500, function(x) mutate(sir_res_df1[[x]], sim_no = x))
+sir_res_df1 <- lapply(1:500, function(x) {
+  sir_res_df1[[x]] %>% 
+    mutate(sim_no = x,
+           rec_time = sir_res1[[x]][["rec_time"]])
+  }
+)
 
 sir_res_all1 <- do.call("rbind", sir_res_df1) %>% 
   group_by(status, step) %>% 
   mutate(mean = mean(value),
          sd = sd(value), 
          upper = mean + 2*sd,
-         lower = mean - 2*sd)
+         lower = mean - 2*sd) %>% 
+  ungroup()
 
   
 ```
@@ -419,7 +429,7 @@ sir_res2 <- lapply(1:500, function(x) {
 )
 
 sir_res_sum2 <- lapply(1:500, function(x) {
-  lapply(sir_res2[[x]], colSums)
+  lapply(sir_res2[[x]][1:3], colSums)
   }
 )
 
