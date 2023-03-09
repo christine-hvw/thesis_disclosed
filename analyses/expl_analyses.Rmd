@@ -251,13 +251,15 @@ Similar to [`epimdr::NetworkSIR()`](https://github.com/objornstad/epimdr/blob/ma
 
 ```{r}
 model_sir_multiplex <- function(adj_mats, tau, gamma,
-                                seed_infs = 1, random_seed = 789, t_max = Inf) {
+                                seed_infs = 1, random_seed = 789, t_max = Inf,
+                                out = "all") {
   #adj_mats = list of separate adj. mats. per layer (= node tensor)
   #tau  =  vector of probabilities of infection across an edge in each layer
   #gamma  =  recovery time (not layer specific)
   #seed_infs = no. of infected seed nodes
   #random_seed = seed for sampling seed nodes (lol)
   #t_max = max. no. of time steps
+  #out = return value: sir_mat, time_to_inf, all (=both)
   
   layers <- length(adj_mats)
   N <- dim(adj_mats[[1]])[1]
@@ -322,8 +324,20 @@ model_sir_multiplex <- function(adj_mats, tau, gamma,
     R <- cbind(R, nextR)
   }
   
-  res <- list(I = I, S = S, R = R)
-  return(res)
+  SIR <- list(S = S, I = I, R = R)
+  
+  s_times <- rowSums(S)
+  s_times[s_times == ncol(S)] <- Inf
+      
+  switch(out,
+         
+    sir_mat = return(SIR),
+    
+    time_to_inf = return(s_times),
+    
+    all = return(list("sir_mat" = SIR, "time_to_inf" = s_times))
+    )
+  
 }
 ```
 
@@ -332,7 +346,8 @@ Test function.
 ```{r}
 sir_res_tst <- model_sir_multiplex(adj_mats = node_tensor, 
                                    tau = c(.3, .1, .2, .3), gamma = 5,
-                                   seed_infs = 1, random_seed = 123, t_max = Inf)
+                                   seed_infs = 1, random_seed = 123, t_max = Inf,
+                                   out = "sir_mat")
 
 {plot(apply(sir_res_tst$S,2,sum), type = "l", xlab = "Time", ylab = "Count")
 lines(apply(sir_res_tst$I,2,sum), type = "l", col = "red")
@@ -353,7 +368,8 @@ Run k simulations and collect results in one data frame for plotting.
 sir_res <- lapply(1:500, function(x) {
   model_sir_multiplex(adj_mats = node_tensor, 
                       tau = c(.3, .1, .2, .3), gamma = 5,
-                      seed_infs = 1, random_seed = x, t_max = Inf)
+                      seed_infs = 1, random_seed = x, t_max = Inf,
+                      out = "sir_mat")
   }
 ) 
 
@@ -423,5 +439,39 @@ sir_res_all %>%
             duration_min = min(duration),
             duration_max = max(duration),
             duration_sd = sd(duration))
+```
+
+Get only time to infection as result.
+
+```{r}
+sir_res_itimes <- lapply(1:500, function(x) {
+  model_sir_multiplex(adj_mats = node_tensor, 
+                      tau = c(.3, .1, .2, .3), gamma = 5,
+                      seed_infs = 1, random_seed = x, t_max = Inf,
+                      out = "time_to_inf")
+  }
+) 
+
+# make data frame
+itimes_df <- do.call("cbind", sir_res_itimes) %>% 
+  as.data.frame() %>% 
+  `colnames<-` (1:length(sir_res_itimes)) %>% 
+  mutate(node_id = row_number()) %>% 
+  pivot_longer(-node_id, values_to = "time_to_inf", names_to = "sim")
+```
+
+# Prediciton model
+
+Inspect DV: Time to infection.
+
+```{r}
+library(ggpubr)
+
+itimes_df %>% 
+  mutate(time_to_inf = ifelse(time_to_inf == Inf, -1, time_to_inf)) %>% 
+  #group_by(sim) %>% 
+  #mutate(mean)
+  ggviolin(y = "time_to_inf", x = 1, add = "boxplot") %>% 
+  ggpar(orientation = "horizontal")
 ```
 
