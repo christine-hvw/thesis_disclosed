@@ -27,6 +27,8 @@ nodes <- read.csv(here("dummy_data/popnet_nodelist.csv"))
 edges <- read.csv(here("dummy_data/popnet_edgelist.csv"))
 ```
 
+Data checks and wrangling 
+
 ```{r}
 # types of edges
 edges %>% 
@@ -38,6 +40,25 @@ length(unique(c(edges$source, edges$target)))
 
 # missing nodes
 nodes[!nodes$node_id %in%  unique(c(edges$source, edges$target)),]
+
+# self-edges
+edges %>% 
+  filter(source == target)
+edges <- filter(edges, !source == target)
+
+# check if all edges are reciprocal
+edges %>% 
+  mutate(fromto = paste(source, target, sep = "-"),
+         tofrom = paste(target, source, sep = "-")) %>% 
+  filter(!(fromto %in% tofrom) | !(tofrom %in% fromto)) 
+
+# filter for relations of interest
+family <-  c('sibling', 'parent', 'child')
+
+edges <- edges %>% 
+  mutate(edgetype = ifelse(edgetype %in% family, "family", edgetype)) %>% 
+  filter(edgetype %in% c("family", "work", "household", "school")) %>% 
+  arrange(source, target)
 ```
 
 **Network sampling**
@@ -68,41 +89,30 @@ egdes_sample <- edges[(edges$source %in% child_sample_ids | edges$target %in% ch
 Here, proceed with full data set.
 
 ```{r}
-# Make single-layer network
-g_all <- graph_from_data_frame(d = edges[, c("source", "target")],
-                               vertices = nodes$node_id)
-```
-
-```{r}
 # Make multi-layer network
 groups <- unique(edges$edgetype)
-layers <- 4 # (after collapsing family categories)
+layers <- length(groups) # (after collapsing family categories etc.)
 obs <- nrow(nodes)
 
 node_tensor <- list()
 g_list <- list()
 
+
 for (g in groups) {
-  graph <- graph_from_data_frame(d = edges[edges$edgetype == g, c("source", "target")],
+  # get first directed graph (otherwise edges are counted twice)
+  g_foo <- graph_from_data_frame(edges[edges$edgetype == g, c("source", "target")], 
+                                 directed = TRUE,
                                  # include ALL vertices
                                  vertices = nodes$node_id)
-  g_list[[g]] <- graph
-  node_tensor[[g]] <- as_adjacency_matrix(graph)
+
+  # get adjacency matrix of that graph 
+  node_tensor[[g]] <- as_adjacency_matrix(g_foo)
+
+  # now get final undirected graph with multiple edges as edge weights
+  g_list[[g]] <- graph_from_adjacency_matrix(node_tensor[[g]],
+                                             mode = "undirected", 
+                                             weighted = TRUE)
 }
-
-
-# collapse corresponding categories into "family"
-family <-  c('aunt / uncle', 'neighbor', 'cousin', 'mother / father-in-law', 'sibling',  'grandchild', 'grandparent',  'niece / nephew', 'parent', 'sister / brother-in-law',  'child', 'daughter / son-in-law', 'partner')
-
-graph_fam <- graph_from_data_frame(d = edges[edges$edgetype %in% family, c("source", "target")],
-                                   # include ALL vertices
-                                   vertices = nodes$node_id)
-g_list[["family"]] <- graph_fam
-node_tensor[["family"]] <- as_adjacency_matrix(graph_fam)
-
-# remove subcategories of family from graph
-g_list <- g_list[!names(g_list) %in% family]
-node_tensor <- node_tensor[!names(node_tensor) %in% family]
 
 # Define layer tensor
 layer_tensor <- Matrix(c(0,1,1,1,
@@ -112,6 +122,12 @@ layer_tensor <- Matrix(c(0,1,1,1,
 
 # Build supra-adjacency matrix
 M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor, layers, obs)
+
+# Make single-layer network
+#adj_all <- GetAggregateMatrix(node_tensor, layers, obs)
+adj_all <- node_tensor[[1]] + node_tensor[[2]] + node_tensor[[3]] + node_tensor[[4]]
+g_all <-  graph_from_adjacency_matrix(adj_all, mode = "undirected", weighted = TRUE)
+#g_all <- GetAggregateNetworkFromSupraAdjacencyMatrix(M/2, layers, obs)
 ```
 
 # Explore multi-layer network
@@ -140,7 +156,7 @@ lay <- layoutMultiplex(g_list, layout = "comp", box = TRUE)
 plot_multiplex3D(g_list,
   layer.layout = lay, layer.colors = c(2:5),
   layer.shift.x = 0.3, layer.space = 2,
-  layer.scale = 2.2, layer.alpha = rep(.2, length(g_list)),
+  layer.scale = 2.2, #layer.alpha = rep(.2, length(g_list)),
   layer.labels = names(g_list), layer.labels.cex = 1,
   node.size.values = 6,
   FOV = 0
@@ -156,8 +172,10 @@ knitr::include_graphics("3dplot_dummy.png")
 ## Compute centralities
 
 ```{r}
-deg_single <- degree(g_all)
-deg_mult <- c(GetMultiDegreeSum(M, layers, obs, isDirected = FALSE))
+#deg_single <- degree(g_all, mode = "all")
+#deg_single <- (Matrix::t(sumR(adj_all, 1))+sumR(adj_all, 2))/2
+deg_single <- strength(g_all)
+deg_mult <- c(GetMultiDegree(M, layers, obs, isDirected = FALSE))
 
 eig_single <- eigen_centrality(g_all)$vector
 eig_mult <- c(GetMultiEigenvectorCentrality(M, layers, obs))
@@ -216,7 +234,7 @@ plt_deg <- plot_centrality_ranking("Degree centrality", deg_single, deg_mult, no
 plt_eig <- plot_centrality_ranking("Eigenvector centrality", eig_single, eig_mult, nodes$node_id, yaxis_title = FALSE)
 
 # PageRank
-plt_pr <- plot_centrality_ranking("PageRank centrality", pr_single, pr_mult, nodes$node_id)
+plt_pr <- plot_centrality_ranking("PageRank centrality", pr_single, pr_mult, nodes$node_id, yaxis_title = TRUE)
 
 # Closeness
 plt_clo <- plot_centrality_ranking("Closeness centrality", clo_single, clo_mult, nodes$node_id, yaxis_title = FALSE)
@@ -231,6 +249,14 @@ ggsave(here("analyses/sankeyplot_all.png"), dpi = 600,
        width = 8.2, height = 10)
 ```
 
+```{r, fig.width=12, fig.height=5, warning=FALSE}
+plt_pr <- plot_centrality_ranking("PageRank centrality", pr_single, pr_mult, nodes$node_id, yaxis_title = FALSE)
+
+(plt_deg + plt_eig + plt_pr)
+
+ggsave(here("analyses/sankeyplot_deg-eig-pr.png"), dpi = 600,
+       width = 12.2, height = 5)
+```
 
 ```{r, fig.width=8, fig.height=5, warning=FALSE}
 plt_eig <- plot_centrality_ranking("Eigenvector centrality", eig_single, eig_mult, nodes$node_id)
@@ -250,11 +276,12 @@ ggsave(here("analyses/sankeyplot_eig-pr.png"), dpi = 600,
 Similar to [`epimdr::NetworkSIR()`](https://github.com/objornstad/epimdr/blob/master/rcode/chapter12code.r), [Book link](https://link.springer.com/chapter/10.1007/978-3-319-97487-3_12).
 
 ```{r}
-model_sir_multiplex <- function(adj_mats, tau, gamma,
+model_sir_multiplex <- function(adj_mats, tau, gamma, step_size = 7,
                                 seed_infs = 1, random_seed = 789, t_max = Inf,
                                 out = "all") {
   #adj_mats = list of separate adj. mats. per layer (= node tensor)
   #tau  =  vector of probabilities of infection across an edge in each layer
+  #step_size = length (days) of one iteration 
   #gamma  =  recovery time (not layer specific)
   #seed_infs = no. of infected seed nodes
   #random_seed = seed for sampling seed nodes (lol)
@@ -275,16 +302,19 @@ model_sir_multiplex <- function(adj_mats, tau, gamma,
   S[I1,1] <- 0
   I[I1,1] <- 1
   
-  # set recovery time sampled from Weibull distribution per individual or per simulation
-  rec_time <- rweibull(N, scale = gamma, shape = 1)
-
+  # set weekly recovery probability based on Weibull distribution and step size
+  #rec_prob <- pweibull(step_size, scale = gamma, shape = 1)
+  
+  # sample recovery time for every person
+  rec_time <- rweibull(N, shape = gamma, scale = 1)
+  
   
   # storage for new infections per layer
   newI_layers <- vector(mode = "list", length = layers)
   
   # while there are still infecteds (=not recovered) & t is smaller than t_max...
   t <- 1
-  while(sum(I[,t]) > 0 & t < t_max) {
+  while(sum(I[,t]) > 0 & t <= t_max) {
     
     t <- t + 1
     
@@ -309,9 +339,12 @@ model_sir_multiplex <- function(adj_mats, tau, gamma,
     #   newR <- R[,t-1]
     # }
     
-    # create new recoveries based on Weibull distributed recovery time
-    inf_days <- rowSums(I)
-    newR <- as.integer((inf_days - rec_time > 0) & (I[,t-1]==1)) 
+    # create new recoveries using cumulative recovery probability
+    #newR <- rbinom(N, I[,t-1], rec_prob)
+    
+    # create new recoveries
+    inf_days <- rowSums(I) * step_size
+    newR <- as.integer((inf_days - rec_time > 0) & (I[,t-1] == 1)) 
 
     # update groups for next time step
     nextS <- S[,t-1] - newI
@@ -345,11 +378,12 @@ Test function.
 
 ```{r}
 sir_res_tst <- model_sir_multiplex(adj_mats = node_tensor, 
-                                   tau = c(.3, .1, .2, .3), gamma = 5,
-                                   seed_infs = 1, random_seed = 123, t_max = Inf,
+                                   tau = c(.15, .2, .05, .1), gamma = 5,
+                                   seed_infs = 1, random_seed = 7, t_max = Inf,
                                    out = "sir_mat")
 
-{plot(apply(sir_res_tst$S,2,sum), type = "l", xlab = "Time", ylab = "Count")
+{plot(apply(sir_res_tst$S,2,sum), type = "l", xlab = "Time", ylab = "Count", 
+      ylim = c(0,128), xlim = c(0,13))
 lines(apply(sir_res_tst$I,2,sum), type = "l", col = "red")
 lines(apply(sir_res_tst$R,2,sum), type = "l", col = "blue")
 legend(x = 0.5, y = 120, 
@@ -365,16 +399,16 @@ Run k simulations and collect results in one data frame for plotting.
 
 ```{r}
 # one list per sim. containing status of each node across time steps
-sir_res <- lapply(1:500, function(x) {
-  model_sir_multiplex(adj_mats = node_tensor, 
-                      tau = c(.3, .1, .2, .3), gamma = 5,
+sir_res <- lapply(1:1000, function(x) {
+  model_sir_multiplex(adj_mats = node_tensor, step_size = 7, 
+                      tau = c(.15, .2, .05, .1), gamma = 5,
                       seed_infs = 1, random_seed = x, t_max = Inf,
                       out = "sir_mat")
   }
 ) 
 
 # cumulative results
-sir_res_sum <- lapply(1:500, function(x) {
+sir_res_sum <- lapply(1:1000, function(x) {
   lapply(sir_res[[x]], colSums)
   }
 )
@@ -391,7 +425,7 @@ sir_res_df <- lapply(sir_res_sum, function(x) {
   }
 )
 
-sir_res_df <- lapply(1:500, function(x) mutate(sir_res_df[[x]], sim_no = x))
+sir_res_df <- lapply(1:1000, function(x) mutate(sir_res_df[[x]], sim_no = x))
 
 # bind all simulations into one data frame
 sir_res_all <- do.call("rbind", sir_res_df) %>% 
@@ -405,15 +439,29 @@ sir_res_all <- do.call("rbind", sir_res_df) %>%
 Plot count of nodes in respective status for each simulation.
 
 ```{r, fig.width=9}
-ggplot(sir_res_all, aes(x = step, y = value)) +
-  geom_line(aes(color = as.factor(status), group = sim_no),
+sir_res_all %>% 
+  mutate(status = factor(status, levels = c("S", "I", "R"))) %>% 
+  ggplot(aes(x = step, y = value)) +
+  geom_line(aes(color = status, group = sim_no),
             alpha = .2, linewidth = .5) +
   facet_wrap(~ status) +
   scale_color_brewer(type = "qual", palette = "Dark2") +
   theme_light() +
   theme(legend.position = "none")
 ```
-
+```{r, fig.width=9}
+sir_res_all %>% 
+  mutate(status = factor(status, levels = c("S", "I", "R"))) %>% 
+  group_by(sim_no, status) %>% 
+  summarise(max = max(value)) %>% 
+  ungroup() %>% 
+  filter(status == "R") %>% 
+  ggplot(aes(x = max, fill = status)) +
+  geom_histogram(bins = 100) +
+  facet_wrap(~ status) +
+  theme_light() +
+  theme(legend.position = "none")
+```
 Also get descriptive statistics.
 
 - Sum of S,I,R
@@ -460,18 +508,5 @@ itimes_df <- do.call("cbind", sir_res_itimes) %>%
   pivot_longer(-node_id, values_to = "time_to_inf", names_to = "sim")
 ```
 
-# Prediciton model
 
-Inspect DV: Time to infection.
-
-```{r}
-library(ggpubr)
-
-itimes_df %>% 
-  mutate(time_to_inf = ifelse(time_to_inf == Inf, -1, time_to_inf)) %>% 
-  #group_by(sim) %>% 
-  #mutate(mean)
-  ggviolin(y = "time_to_inf", x = 1, add = "boxplot") %>% 
-  ggpar(orientation = "horizontal")
-```
 
