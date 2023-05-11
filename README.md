@@ -10,9 +10,9 @@ This repository is a publicly accessible version of my thesis project. It serves
 
 To reproduce results shown in the thesis manuscript (`thesis_chw_v080523.pdf`), all code in the file `analyses.Rmd` has to be executed after obtaining access to the original data ([info below](#data-access)).
 
-The code, data and output on the branch [`example_analyses`](link-to-branch) served experimentation purposes in earlier stages of the project.
+The code, data and output on the branch [`example_analyses`](https://github.com/christine-hvw/thesis_disclosed/tree/example_analyses) served experimentation purposes in earlier stages of the project.
 
-![grafik](https://github.com/christine-hvw/thesis_disclosed/blob/example-analyses/analyses/3dplot_dummy.png?raw=true)
+![grafik](https://github.com/christine-hvw/thesis_disclosed/blob/example_analyses/analyses/3dplot_dummy.png)
 
 ---
 
@@ -27,7 +27,9 @@ The code, data and output on the branch [`example_analyses`](link-to-branch) ser
 | `thesis_chw_v080523.pdf`| manuscript of thesis as submitted on 8 May 2023                                 |
 
 
-### Data Access {#data-access}
+<a id="data-access"></a>
+
+### Data Access
 
 *Disclaimer*: Results are based on calculations by the author using non-public micro-data from Statistics Netherlands (CBS). Under certain conditions, these micro-data are accessible for statistical and scientific research. For further information contact microdata@cbs.nl.
 
