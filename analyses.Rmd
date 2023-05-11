@@ -1,0 +1,1178 @@
+---
+title: "Predicting Covid-19 infections using multi-layer centrality measures"
+subtitle: "Analysis script"
+author: "Christine Hedde-von Westernhagen"
+date: "15-05-2023"
+output: html_document
+---
+
+>> This file describes and executes all data preparation and analyses conducted for the thesis project. 
+
+>> Intermediary data objects are stored in the `data_processed` folder.
+
+>> Tables with analysis results are stored in the `results` folder. 
+
+>> For more info see README.md.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(haven)      # importing spss files
+library(data.table) # fast data reading and manipulation
+library(dtplyr)     # data.table interface to dplyr
+library(tidyverse)  # packages for data wrangling
+library(muxViz)     # multi-layer network operations
+library(Matrix)     # for sparse matrices
+library(igraph)     # single-layer network operations
+library(writexl)    # results need to be exported to excel
+library(survival)   # Cox regressions
+
+# Import custom auxiliary functions
+source("aux_functions.R")
+```
+
+
+# Data prep
+
+## File paths
+
+Save important file paths to CBS data.
+
+- network data: G:/Bevolking/PN/
+- schools and their locations: G:/Onderwijs/BRINADRESSEN/
+- registered students: G:/Onderwijs/INSCHRWPOTAB/
+- Covid tests: G:/Maatwerk/CORONIT/CoronIT_GGD_testdata_20210921.sav
+
+Linktypes in network data:
+
+- 101	tante/oom	familie
+- 102	co-ouder	familie
+- 103	zus/broer - vol	familie
+- 104	ouder	familie
+- 105	volle nicht/neef	familie
+- 106	nicht/neef	familie
+- 107	kind	familie
+- 108	kleinkind	familie
+- 109	zus/broer - onbekend	familie
+- 110	grootouder	familie
+- 111	zus/broer - half	familie
+- 201	partner	huishouden
+- 202	huisgenoot	huishouden
+- 203	huisgenoot - institutioneel	huishouden
+- 301	buur	buren
+- 401	collega	werk
+- 402	collega - steekproef	werk
+- 501	klasgenoot - basis	school
+- 502	klasgenoot - speciaal voortgezet	school
+- 503	klasgenoot - voortgezet	school
+- 504	klasgenoot - mbo	school
+- 505	klasgenoot - ho	school
+
+
+```{r}
+# Define all file paths and variables of interest within files
+
+path_pn <- "G:/Bevolking/PN/"
+
+files_pn <- c("family_edges" = "PersNw2018_v1.0_links_familie.csv",
+              "household_edges" = "PersNw2018_v1.0_links_huishouden.csv",
+              "work_edges" = "PersNw2018_v1.0_links_werk.csv",
+              "edge_labels" = "PersNw2018_v1.0_linktype_labels.csv"
+              )
+
+
+path_brinadressen <- "G:/Onderwijs/BRINADRESSEN/"
+
+files_brinadressen <- list.files(path_brinadressen, pattern = "(2020).+$")
+  
+vars_brinadressen <- c("brin_crypt", "brinvest", "gemcode", "plaatsnaam", "POSTCODE")
+
+
+path_education <- "G:/Onderwijs/INSCHRWPOTAB/"
+
+files_education <- list.files(path_education, pattern = "(2020V2).+$")
+
+vars_education = c("RINPERSOONS", #if RINPERSOON available or not
+                   "RINPERSOON",  #ID to link to other data
+                   "ONDERWIJSNR_crypt",  #student id
+                   "WPOBRIN_crypt", #education site id
+                   "WPOOPLNR", #type of education
+                   "WPOTYPEPO", #type education (BO, SBO, SO, VSP, NVTc)
+                   "WPOBRINVEST", #branch of the education site
+                   "WPOLEERJAAR", #year of education
+                   "WPOVERBLIJFSJRBO", # number of years in the school
+                   "WPODENOMINATIE" #type of school, algemeen, antroposofish, etc
+                   )
+
+path_rivm <- "G:/Maatwerk/CORONIT/CoronIT_GGD_testdata_20210921.sav"
+```
+
+## Schools
+
+Read the school and student data, merge students with schools, filter data:
+
+- only basis onderwijs
+- only registered in the GBA
+- only gemeente Amsterdam
+
+```{r}
+# Read school addresses and individual education data 
+brinadressen_dat <- as.data.table(read_spss(paste0(path_brinadressen, files_brinadressen)))
+
+education_dat <- as.data.table(read_spss(paste0(path_education, files_education), 
+                                         col_select = all_of(vars_education)))
+
+# Merge education records and location of schools 
+eduadress_dat <-  education_dat %>% 
+  left_join(brinadressen_dat, by = c("WPOBRIN_crypt" = "BRIN_crypt", 
+                                     "WPOBRINVEST" = "BRINVest")) %>% 
+  # filter for children registered in GBA; only basis onderwijs
+  filter(RINPERSOONS == "R" & WPOTYPEPO == "BO") %>%
+  # filter gemeente Amsterdam
+  mutate(POSTCODE = as.numeric(POSTCODE)) %>% 
+  filter(POSTCODE %in% c(1000:1109)) %>% 
+  # get variables of interest
+  select(any_of(c(vars_education, vars_brinadressen))) %>% 
+  as.data.table()
+```
+
+Create school edgelist by joining student data with "itself", i.e., adding classmates based on "WPOBRIN_crypt" and "WPOLEERJAAR".
+
+```{r}
+school_edges <- eduadress_dat %>%
+  select(from = RINPERSOON, WPOBRIN_crypt, WPOLEERJAAR) %>%
+  # add classmates
+  left_join(distinct(eduadress_dat[,c("RINPERSOON", "WPOBRIN_crypt", "WPOLEERJAAR")])) %>%
+  rename("to" = "RINPERSOON") %>%
+  # delete self-edges
+  filter(from != to) %>%
+  as.data.table()
+
+students <- unique(c(school_edges$from, school_edges$to))
+```
+
+Read in edgelists for other layers and reduce to student sample:
+
+## Families
+
+Keep only parent-child, and sibling relations for this layer.
+
+```{r}
+# Read in family edges
+family_edges <- fread(file = paste0(path_pn, files_pn["family_edges"]), 
+                      verbose = TRUE, colClasses = list(character = 1:4))
+
+# Get edge attributes (and select subset: parents-children-siblings)
+link_labels <- fread(file = paste0(path_pn, files_pn["edge_labels"]), verbose = FALSE)
+keep_codes <- c(103, 104, 107, 109, 111)
+
+# Subset family edges to relations of interest and sampled students
+family_edges_sub <- family_edges %>%
+  filter((linktype %in% keep_codes) &
+         (RINPERSOONSRC %in% students | RINPERSOONDST %in% students)) %>%
+  as.data.table()
+
+rm(family_edges)
+
+# Make sure all students are also part of the family network ~ PN data is from 2018, school data 2020
+# (this also has to be done for households) 
+school_edges_sub <- school_edges %>%
+  filter(from %in% c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST) &
+           to %in% c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST)) %>%
+  as.data.table()
+
+# Update student list
+students <- unique(c(school_edges_sub$from, school_edges_sub$to))
+```
+
+## Households
+
+Basically same procedure as for family relations.
+
+```{r}
+# Read in household edges
+household_edges <- fread(file = paste0(path_pn, files_pn["household_edges"]), 
+                         verbose = TRUE, colClasses = list(character = 1:4))
+
+# Add partners and co-cohabitants as desired links
+keep_codes <- c(keep_codes, 201, 202, 203)
+
+# Subset household edges to relations of interest and sampled students
+household_edges_sub <- household_edges %>% 
+  filter((linktype %in% keep_codes) &
+         (RINPERSOONSRC %in% students | RINPERSOONDST %in% students)) %>% 
+  as.data.table()
+
+rm(household_edges)
+
+# Make sure all students are also part of the household network ~ PN data is from 2018, school data 2020
+school_edges_sub <- school_edges_sub %>% 
+  filter(from %in% c(household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST) &
+           to %in% c(household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST)) %>% 
+  as.data.table()
+
+# Get students that were removed in previous step
+hh_remove <- students[!students %in% unique(c(school_edges_sub$from, school_edges_sub$to))]
+
+# Make family edgelist a graph to get neighbors of removed nodes
+family_edges_sub_g <- family_edges_sub %>%
+  select(RINPERSOONSRC, RINPERSOONDST) %>% 
+  as.data.frame() %>% 
+  as.matrix() %>% 
+  graph_from_edgelist()
+
+neighs <- sapply(hh_remove, neighbors, graph = family_edges_sub_g)
+neighs <- sapply(1:length(neighs), function(x) names(neighs[[x]]))
+
+# Remove persons from family network based on student non-presence in HH network
+family_edges_sub <- family_edges_sub %>% 
+  filter(!(RINPERSOONSRC %in% c(hh_remove, neighs) | RINPERSOONDST %in% c(hh_remove, neighs))) %>% 
+  as.data.table()
+```
+
+## Workplaces
+
+Co-worker edges are added to all nodes present in the network up to this point. Relations need to be made symmetric first.
+
+```{r}
+# Read in work edges
+work_edges <- fread(file = paste0(path_pn, files_pn["work_edges"]), 
+                    verbose = TRUE, colClasses = list(character = 1:4))
+
+# Add coworkers as desired links
+keep_codes <- c(keep_codes, 401, 402)
+
+# Get ids of nodes in network so far
+nodes_nowork <- unique(c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST,
+                         household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST,
+                         school_edges_sub$RINPERSOONSRC, school_edges_sub$RINPERSOONDST))
+
+# Filter for nodes already included in network as source nodes
+work_edges_sub <- work_edges %>% 
+  filter((linktype %in% keep_codes) &
+         (RINPERSOONSRC %in% nodes_nowork |
+           RINPERSOONDST %in% nodes_nowork)
+         ) %>% 
+  as.data.table()
+
+# Get asymmetric relationships
+work_edges_asym <- work_edges_sub %>% 
+  # check and filter for asymmetric relations
+  mutate(fromto = paste(RINPERSOONSRC, RINPERSOONDST, sep = "-"),
+         tofrom = paste(RINPERSOONDST, RINPERSOONSRC, sep = "-")) %>% 
+  filter(!(fromto %in% tofrom) | !(tofrom %in% fromto)) %>% 
+  # reverse from-to
+  rename(RINPERSOONSRC = RINPERSOONDST,
+         RINPERSOONDST = RINPERSOONSRC) %>% 
+  select(-c(6:7)) %>% 
+  as.data.table()
+
+# Add reverse relationships of asymmetrical ties to create symmetric data
+work_edges_sym <- work_edges_sub %>% 
+  bind_rows(work_edges_asym)
+
+rm(work_edges)
+```
+
+Save all edgelists as intermediary files, so they can quickly be accessed again.
+
+```{r}
+saveRDS(school_edges_sub, "data_processed/school_edges_sub.RDS")
+saveRDS(family_edges_sub, "data_processed/family_edges_sub.RDS")
+saveRDS(household_edges_sub, "data_processed/household_edges_sub.RDS")
+# Because they take long to create, save both work edgelists, just in case
+saveRDS(work_edges_sub, "data_processed/work_edges_sub.RDS")
+saveRDS(work_edges_sym, "data_processed/work_edges_sym.RDS")
+```
+
+## Make multi-layer network
+
+Based on the individual layers created above, make a multi-layer network object. This has 4 ingredients:
+
+- node tensor: the collection of edge lists created above -> defines *intra*-layer relations
+- layer tensor: defines *inter*-layer relations, here categorical couplings because multiplex
+- no. layers (implicit from layer tensor and node tensor)
+- no. observations in each layer: here same across layers because multiplex
+
+Result: supra-adjacency matrix of the multi-layer network
+
+```{r}
+# From here on treat work_edges_sym as work_edges_sub for conformity with other data
+work_edges_sub <- work_edges_sym
+rm(work_edges_sym)
+
+# Define network characteristics
+groups <- c("family", "school", "household", "work")
+layers <- length(groups)
+nodes <- unique(c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST,
+                  household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST,
+                  work_edges_sub$RINPERSOONSRC, work_edges_sub$RINPERSOONDST))
+obs <- length(nodes) 
+
+# Rename school edge variables for conformity
+school_edges_sub <- school_edges_sub %>% 
+  rename(RINPERSOONSRC = from, RINPERSOONDST = to) %>% 
+  as.data.table()
+
+# Create node tensor
+node_tensor <- list()
+g_list <- list()
+
+for (g in groups) {
+  # get edgelist for group from global env.
+  group <- get(paste(g, "edges_sub", sep = "_"))
+  
+  # first get directed graph since that's the format of the edgelists (undirected -> edges counted twice)
+  g_foo <- graph_from_data_frame(d = group[, c("RINPERSOONSRC", "RINPERSOONDST")],
+                                 vertices = nodes,
+                                 directed = TRUE)
+  
+  # adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
+  node_tensor[[g]] <- as_adjacency_matrix(g_foo)
+  
+  # get final undirected graph
+  g_list[[g]] <- graph_from_adjacency_matrix(node_tensor[[g]],
+                                             mode = "undirected",
+                                             weighted = TRUE)
+  rm(group, g_foo)
+}
+
+saveRDS(node_tensor, "data_processed/node_tensor.RDS")
+
+# Define multiplex layer tensor
+layer_tensor <- Matrix(c(0, 1, 1, 1, 
+                         1, 0, 1, 1,
+                         1, 1, 0, 1,
+                         1, 1, 1, 0), ncol = layers, sparse = TRUE)
+
+# >>> Make a supra-adjacency matrix <<<
+M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor, layers, obs)
+
+saveRDS(M, "data_processed/M.RDS")
+```
+
+Also make single-layer network for comparative analyses.
+
+```{r}
+# Adjacency matrix
+adj_all <- node_tensor[[1]] + node_tensor[[2]] + node_tensor[[3]] + node_tensor[[4]]
+
+# Graph object
+g_all <- graph_from_adjacency_matrix(adj_all, mode = "undirected", weighted = TRUE)
+```
+
+# Descriptive statistics network
+
+Get descriptive statistics of the individual network layers and the aggregate.
+
+> Results: Table 1 in manuscript
+
+```{r}
+# Construct graph for each layer as above, BUT not including all nodes in all layers
+g_list_lwise <- lapply(groups, function(g) {
+  # get edgelist for group from global env.
+  group <- get(paste(g, "edges_sub", sep = "_"))
+  
+  # first get directed graph since that's the format of the edgelists 
+  # (undirected -> edges counted twice)
+  g_foo <- graph_from_data_frame(d = group[, c("RINPERSOONSRC", "RINPERSOONDST")],
+                                 # NOT include all nodes this time
+                                 directed = TRUE)
+  
+  # adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
+  adj_mat <- as_adjacency_matrix(g_foo)
+  
+  # get final undirected graph
+  graph_from_adjacency_matrix(adj_mat,
+                              mode = "undirected",
+                              weighted = TRUE)
+  }
+)
+names(g_list_lwise) <- groups
+
+# Calculate network statistics 
+desc_list <- lapply(c(g_list_lwise, "aggregate" = list(g_all)), function(x) {
+  n <- vcount(x)
+  edges <- ecount(x)
+  clust <- transitivity(x, type = "global")
+  deg <- degree(x)
+  
+  return(data.frame("nodes" = n, "edges" = edges, "clustering" = clust, 
+                    "p05_degree" = quantile(deg, probs = 0.05), 
+                    "p05_degree_n" = sum(deg == quantile(deg, probs = 0.05)),
+                    "mean_degree" = mean(deg), 
+                    "med_degree" = median(deg), "med_degree_n" = sum(deg == median(deg)),
+                    "p95_degree" = quantile(deg, probs = 0.95), 
+                    "p95_degree_n" = sum(deg == quantile(deg, probs = 0.95)),
+                    "sd_degree" = sd(deg)))
+})
+
+# Write to file
+do.call("rbind", desc_list) %>% 
+  rownames_to_column(var = "layer") %>% 
+  write_xlsx("results/descriptives_network.xlsx")
+```
+
+
+# Correlations multi- and single-layer centralities
+
+## Compute centrality measures
+
+Functions for multi-layer centralities are based on muxViz but needed to be adapted in some parts to work on a network of this size (see aux_functions.R).
+
+```{r}
+deg_single <- strength(g_all)
+deg_mult <- GetMultiDegree_edit(M, layers, obs, isDirected = FALSE)
+
+eig_single <- eigen_centrality(g_all)$vector
+eig_mult <- GetMultiEigenvectorCentrality_edit(M, layers, obs)
+
+pr_single <- page_rank(g_all)$vector
+pr_mult <- GetMultiPageRankCentrality_edit(M, layers, obs)
+```
+
+## Correlations
+
+> Results: Table 2 in manuscript
+
+```{r}
+cor_within <- cor(data.frame(deg_mult, eig_mult, pr_mult, deg_single, eig_single, pr_single))
+
+write_xlsx(as_tibble(cor_within, rownames = "measure"), "results/correlations_within.xlsx")
+```
+
+
+# Epidemic modeling
+
+Simulate epidemic k=500 times and save time to infection (tti) and duration of epidemic. Function model_sir_multiplex() is described in aux_functions.R.
+
+Transmission rate tau:    
+
+- family = .15
+- school = .10
+- household = .20
+- work = .05
+
+```{r}
+sir_tti_duration <- lapply(1:500, function(x) {
+  cat(x, " ")
+  model_sir_multiplex(node_tensor,
+                      tau = c(.15, .1, .2, .05), gamma = 5, step_size = 7,
+                      seed_infs = 10, random_seed = x, t_max = 100,
+                      out = "tti_duration", verbose = FALSE)
+})
+
+saveRDS(sir_tti_duration, "data_processed/sir_tti_duration.RDS")
+
+# get only time to infection
+sir_tti <- lapply(sir_tti_duration, "[[", 1)
+
+# get only duration of epidemic
+sir_duration <- sapply(sir_tti_duration, "[[", 2)
+```
+
+## Descriptive statistics of epidemic
+
+> Results: Table 7 in manuscript (Appendix A)
+
+```{r}
+# Get % of infected per simulation
+pct_inf_sim <- sapply(sir_tti, function(x) sum(x < Inf)/length(x)*100)
+
+# Remove simulations where epidemic does not spread
+#...for tti
+sir_tti_sub <- sir_tti[pct_inf_sim > 25]
+#... and duration
+sir_duration_sub <- sir_duration[pct_inf_sim > 25]
+
+# Summary on simulation basis
+desc_epi <- data.frame(
+  "duration" = sir_duration_sub,
+  "infections" = sapply(sir_tti_sub, function(x) sum(x < Inf)/length(x)*100),
+  "tti_mean" = sapply(sir_tti_sub, function(x) mean(x[x < Inf]))
+)
+
+# Summary on node basis
+inf_per_node <- do.call("cbind", sir_tti_sub) %>% 
+  apply(., 1, function(x) sum(x < Inf)/length(x)*100)
+
+# % Nodes never infected
+never_infected <- sum(inf_per_node == 0)/length(inf_per_node)*100
+
+# Max. % infected in non-epidemics
+max_infected_nonepi <- 
+  max(sapply(sir_tti[pct_inf_sim < 25], function(x) length(x[x<Inf]))) / obs *100
+
+# Calculate summaries and collect in one table
+desc_epi_summary <- desc_epi %>% 
+  summarize(across(everything(), list(
+    min = ~min(.x),
+    mean = ~mean(.x),
+    median = ~median(.x),
+    max = ~max(.x),
+    sd = ~sd(.x)
+  ))) %>% 
+  mutate(infpernode_min = min(inf_per_node),
+         infpernode_mean = mean(inf_per_node),
+         infpernode_median = median(inf_per_node),
+         infpernode_max = max(inf_per_node),
+         infpernode_sd = sd(inf_per_node)) %>% 
+  pivot_longer(everything(), names_to = c("measure", "statistic"), 
+               names_pattern = "(.+)_(.+$)") %>% 
+  add_row(measure = "never_infected", statistic = "total_pct", value = never_infected) %>% 
+  add_row(measure = "max_infected_nonepi", statistic = "total_pct", value = max_infected_nonepi)
+
+write_xlsx(desc_epi_summary, "results/descriptives_epidemic.xlsx")
+```
+
+Prepare the outcome variable (tti) for prediction tasks. It's a list of length=no. epidemic simulations, each element is vector of tti's for all the nodes in the network.
+
+```{r}
+# replace Inf with NA for easier handling
+tti <- lapply(sir_tti_sub, function(x) replace(x, x == Inf, NA))
+
+saveRDS(tti, "data_processed/tti.RDS")
+```
+
+
+# Prediciton of outbreaks
+
+## Rank correlations
+
+Calculate Spearman's rho for each centrality and the time to infection. Do that for each simulated epidemic and then summarize over simulations.
+
+> Results: Table 3 in manuscript
+
+```{r}
+# Multi-layer
+correlations_multi <- lapply(1:length(tti), function(x) {
+  
+  degree <- cor(tti[[x]], deg_mult, use = "complete.obs", method = "spearman")
+  eigenvector <- cor(tti[[x]], eig_mult, use = "complete.obs", method = "spearman")
+  pagerank <- cor(tti[[x]], pr_mult, use = "complete.obs", method = "spearman")
+  
+  list("degree" = degree, "eigenvector" = eigenvector, "pagerank" = pagerank)
+})
+
+saveRDS(correlations_multi, "results/correlations_multi.RDS")
+
+correlations_summary_multi <- 
+  do.call("rbind", lapply(correlations_multi, function(x) do.call("cbind", x))) %>% 
+  as.data.frame() %>% 
+  `colnames<-` (c("degree", "eigenvector", "pagerank")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-4, names_to = "measure", values_to = "value") %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(measure) %>% 
+  summarise(mean_trans = fisher_z_transform(mean(value_trans), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans) - 1.96*(sd(value_trans)/sqrt(obs))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans) + 1.96*(sd(value_trans)/sqrt(obs))), 
+                                              back = TRUE)
+            ) %>% 
+  mutate(layer = "multi")
+
+
+# Single-layer
+correlations_single <- lapply(1:length(tti), function(x) {
+  
+  degree <- cor(tti[[x]], deg_single, use = "complete.obs", method = "spearman")
+  eigenvector <- cor(tti[[x]], eig_single, use = "complete.obs", method = "spearman")
+  pagerank <- cor(tti[[x]], pr_single, use = "complete.obs", method = "spearman")
+  
+  list("degree" = degree, "eigenvector" = eigenvector, "pagerank" = pagerank)
+})
+
+saveRDS(correlations_single, "results/correlations_single.RDS")
+
+correlations_summary_single <- 
+  do.call("rbind", lapply(correlations_single, function(x) do.call("cbind", x))) %>% 
+  as.data.frame() %>% 
+  `colnames<-` (c("degree", "eigenvector", "pagerank")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-4, names_to = "measure", values_to = "value") %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(measure) %>% 
+  summarise(mean_trans = fisher_z_transform(mean(value_trans), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans) - 1.96*(sd(value_trans)/sqrt(obs))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans) + 1.96*(sd(value_trans)/sqrt(obs))), 
+                                              back = TRUE)
+            ) %>% 
+  mutate(layer = "single")
+
+# Combine single and multi and write into one table
+rbind(correlations_summary_single, correlations_summary_multi) %>% 
+  write_xlsx("results/correlations.xlsx")
+```
+
+## Regression task
+
+### Cox proportional hazard models
+
+Create formulas for Cox models.
+
+```{r}
+formulas_cox_mult <- list(
+  # within centrality
+  Surv(time, status) ~ deg_mult, 
+  Surv(time, status) ~ deg_mult + I(deg_mult^2),
+  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
+  Surv(time, status) ~ eig_mult,
+  Surv(time, status) ~ eig_mult + I(eig_mult^2),
+  Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+  Surv(time, status) ~ pr_mult,
+  Surv(time, status) ~ pr_mult + I(pr_mult^2),
+  Surv(time, status) ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  # across centralities, first order
+  Surv(time, status) ~ deg_mult + eig_mult,
+  Surv(time, status) ~ deg_mult + pr_mult,
+  Surv(time, status) ~ eig_mult + pr_mult,
+  Surv(time, status) ~ deg_mult + eig_mult + pr_mult,
+  # across centralities, second order
+  Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
+  Surv(time, status) ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
+  Surv(time, status) ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+  Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+  # across centralities, third order
+  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  # interactions second order
+  Surv(time, status) ~ deg_mult*eig_mult,
+  Surv(time, status) ~ deg_mult*pr_mult,
+  Surv(time, status) ~ eig_mult*pr_mult,
+  # interactions third order
+  Surv(time, status) ~ deg_mult*eig_mult*pr_mult)
+
+# Convert multi to single-layer formulas
+formulas_cox_single <- lapply(formulas_cox_mult, function(x) {
+  chars <- str_replace_all(as.character(x), "mult", "single") %>% 
+    paste(., collapse = " ")
+  form <- formula(str_replace_all(chars, "~ Surv\\(time, status\\)", "Surv\\(time, status\\) ~ ")) 
+  environment(form) <- .GlobalEnv
+  form
+})
+```
+
+Run multi-layer models.
+
+> Results: Tables 4 and 8 in manuscript
+
+```{r}
+# Function to prepare data and run models
+surv_models <- lapply(tti, function(x) {
+  # restructure data
+  df <- data.table(x) %>% 
+  mutate(time = x,
+         status = ifelse(is.na(.data$time), 0, 1)) %>%
+  mutate(time = ifelse(is.na(.data$time),
+                       max(.data$time, na.rm = TRUE), 
+                       .data$time),
+         # add predictors
+         deg_mult = deg_mult[,1],
+         eig_mult = eig_mult[,1],
+         pr_mult = pr_mult[,1]) %>% 
+  as.data.table()
+  
+  lapply(formulas_cox_mult, function(y) {
+    # run models and compute Uno's weighted concordance index
+    # do so safely and catch errors in case of non-convergence
+    fit <- tryCatch(coxph(formula = y, data = df),
+                    error = function(e) {
+                      paste(e$message, y)
+                      FALSE},
+                    warning = function(w) {
+                      paste(w$message, y)
+                      FALSE
+                      })
+    
+    if (isFALSE(fit)) {
+      return("ci" = NA)
+    } else {
+      ci <- concordance(fit, timewt = "n/G2")
+      return(c("ci" = ci))
+    }
+
+  })
+}
+)
+
+saveRDS(surv_models, "results/surv_models.RDS")
+
+
+# Get C from models, summarize over data sets 
+surv_models_ci <- 
+  lapply(surv_models, function(x) sapply(x, function(y) y[[1]])) %>%
+  do.call("rbind", .) %>%
+  as.data.frame() %>% 
+  rename_with(~ str_remove(.x, "V")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-26, names_to = "model", values_to = "value", 
+               names_transform = function(x) as.factor(as.integer(x))) %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(model) %>% 
+  summarise(convergence = sum(!is.na(value))/length(surv_models)*100,
+            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                              back = TRUE)
+            )
+
+write_xlsx(surv_models_ci, "results/surv_models_multi.xlsx")
+```
+
+Run single-layer models.
+
+> Results: Tables 4 and 8 in manuscript
+
+```{r}
+# Function to prepare data and run models
+surv_models_single <- lapply(tti, function(x) {
+  # restructure data
+  df <- data.table(x) %>% 
+  mutate(time = x,
+         status = ifelse(is.na(.data$time), 0, 1)) %>%
+  mutate(time = ifelse(is.na(.data$time),
+                       max(.data$time, na.rm = TRUE), 
+                       .data$time),
+         # add predictors
+         deg_single = deg_single,
+         eig_single = eig_single,
+         pr_single = pr_single) %>% 
+  as.data.table()
+  
+  lapply(formulas_cox_single, function(y) {
+    # run models and compute Uno's weighted concordance index
+    # do so safely and catch errors in case of non-convergence
+    fit <- tryCatch(coxph(formula = y, data = df),
+                    error = function(e) {
+                      paste(e$message, y)
+                      FALSE},
+                    warning = function(w) {
+                      paste(w$message, y)
+                      FALSE
+                      })
+    
+    if (isFALSE(fit)) {
+      return("ci" = NA)
+    } else {
+      ci <- concordance(fit, timewt = "n/G2")
+      return(c("ci" = ci))
+    }
+  })
+}
+)
+
+saveRDS(surv_models_single, "results/surv_models_single.RDS")
+
+
+# Get C from models, summarize over data sets 
+surv_models_ci_single <- 
+  lapply(surv_models_single, function(x) sapply(x, function(y) y[[1]])) %>%
+  do.call("rbind", .) %>%
+  as.data.frame() %>% 
+  rename_with(~ str_remove(.x, "V")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-26, names_to = "model", values_to = "value", 
+               names_transform = function(x) as.factor(as.integer(x))) %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(model) %>% 
+  summarise(convergence = sum(!is.na(value))/length(surv_models)*100,
+            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                              back = TRUE)
+            )
+
+write_xlsx(surv_models_ci_single, "results/surv_models_single.xlsx")
+```
+
+### Linear models
+
+Create formulas for linear regression models.
+
+```{r}
+
+formulas_mult <- list(
+  # within centrality
+  x ~ deg_mult, 
+  x ~ deg_mult + I(deg_mult^2),
+  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
+  x ~ eig_mult,
+  x ~ eig_mult + I(eig_mult^2),
+  x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+  x ~ pr_mult,
+  x ~ pr_mult + I(pr_mult^2),
+  x ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  # across centralities, first order
+  x ~ deg_mult + eig_mult,
+  x ~ deg_mult + pr_mult,
+  x ~ eig_mult + pr_mult,
+  x ~ deg_mult + eig_mult + pr_mult,
+  # across centralities, second order
+  x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
+  x ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
+  x ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+  x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+  # across centralities, third order
+  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+  # interactions second order
+  x ~ deg_mult*eig_mult,
+  x ~ deg_mult*pr_mult,
+  x ~ eig_mult*pr_mult,
+  # interactions third order
+  x ~ deg_mult*eig_mult*pr_mult)
+
+# Convert multi to single-layer formulas
+formulas_single <- lapply(formulas_mult, function(x) {
+  chars <- str_replace_all(as.character(x), "mult", "single") %>% 
+    paste(., collapse = " ")
+  form <- formula(str_replace_all(chars, "~ x", "x ~ ")) 
+  environment(form) <- .GlobalEnv
+  form
+})
+```
+
+Run multi-layer models.
+
+> Results: Tables 5 and 9 in manuscript
+
+```{r}
+# Run linear models and return estimates of interest
+lin_models <- lapply(tti, function(t) lapply(formulas_mult, function(u) {
+  x <<- t
+  r2 <- summary(lm(u))$adj.r.squared
+  rmse <- sqrt(mean(lm(u)$residuals^2))
+  
+  list("r2" = r2, "rmse" = rmse)
+  })
+)
+
+saveRDS(lin_models, "results/lin_models_multi.RDS")
+
+# Save estimates per simulation sub-objects (r2, rmse)
+lin_models_r2 <- 
+  lapply(lin_models, function(x) sapply(x, function(y) y[["r2"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "r2", names_prefix = "V",
+               names_transform = function(x) as.factor(as.integer(x)))
+
+lin_models_rmse <- 
+  lapply(lin_models, function(x) sapply(x, function(y) y[["rmse"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
+               names_transform = function(x) as.factor(as.integer(x)))
+
+# Combine r2 and rmse
+lin_models_measures <- lin_models_r2 %>% 
+  full_join(lin_models_rmse, by = c("sim_no", "model"))
+
+# Summarize estimates over simulations
+lin_models_summary <- lin_models_measures %>% 
+  mutate(r2_trans = fisher_z_transform(r2)) %>% 
+  group_by(model) %>% 
+  mutate(across(rmse, list(
+    mean = ~mean(.x),
+    sd = ~sd(.x))),
+    rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
+    rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
+  mutate(across(r2_trans, list(
+    mean = ~fisher_z_transform(mean(.x), back = TRUE),
+    sd = ~fisher_z_transform(sd(.x), back = TRUE),
+    cilow = ~fisher_z_transform((mean(.x) - 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                     back = TRUE),
+    cihigh = ~fisher_z_transform((mean(.x) + 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                       back = TRUE)
+  ))) %>% 
+  select(-sim_no, -r2, -rmse, -r2_trans) %>% 
+  distinct()
+
+write_xlsx(lin_models_summary, "results/lin_models_multi.xlsx")
+```
+
+Run single-layer models.
+
+> Results: Tables 5 and 9 in manuscript
+
+```{r}
+# Run linear models and return estimates of interest
+lin_models_single <- lapply(tti, function(t) lapply(formulas_single, function(u) {
+  x <<- t
+  r2 <- summary(lm(u))$adj.r.squared
+  rmse <- sqrt(mean(lm(u)$residuals^2))
+  
+  list("r2" = r2, "rmse" = rmse)
+  })
+)
+
+saveRDS(lin_models_single, "results/lin_models_single.RDS")
+
+# Save estimates per simulation sub-objects (r2, rmse)
+lin_models_r2_single <- 
+  lapply(lin_models_single, function(x) sapply(x, function(y) y[["r2"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "r2", names_prefix = "V",
+               names_transform = function(x) as.factor(as.integer(x)))
+
+lin_models_rmse_single <- 
+  lapply(lin_models_single, function(x) sapply(x, function(y) y[["rmse"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
+               names_transform = function(x) as.factor(as.integer(x)))
+
+# Combine r2 and rmse
+lin_models_measures_single <- lin_models_r2_single %>% 
+  full_join(lin_models_rmse_single, by = c("sim_no", "model"))
+
+# Summarize estimates over simulations
+lin_models_summary_single <- lin_models_measures_single %>% 
+  mutate(r2_trans = fisher_z_transform(r2)) %>% 
+  group_by(model) %>% 
+  mutate(across(rmse, list(
+    mean = ~mean(.x),
+    sd = ~sd(.x))),
+    rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
+    rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
+  mutate(across(r2_trans, list(
+    mean = ~fisher_z_transform(mean(.x), back = TRUE),
+    sd = ~fisher_z_transform(sd(.x), back = TRUE),
+    cilow = ~fisher_z_transform((mean(.x) - 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                     back = TRUE),
+    cihigh = ~fisher_z_transform((mean(.x) + 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                       back = TRUE)
+  ))) %>% 
+  select(-sim_no, -r2, -rmse, -r2_trans) %>% 
+  distinct()
+
+write_xlsx(lin_models_summary_single, "results/lin_models_single.xlsx")
+```
+
+## Tau-weighted multi-layer degree
+
+Calculate new centrality measure based on transmission rate values (tau) for each layer as used in epidemic simulation. See aux_functions.R for definition of GetMultiTauDegree().
+
+```{r}
+# Get and normalize taus used in simulation
+taus <- c(.15, .1, .2, .05)
+taus_norm <- taus/sum(taus)
+
+# Calculate cenrtality
+deg_multtau <- GetMultiTauDegree(M, layers, obs, taus_norm)
+```
+
+Set up formulas for regression models.
+
+```{r}
+# Linear regressions
+formulas_taudegree <- list(
+  x ~ deg_multtau, 
+  x ~ deg_multtau + I(deg_multtau^2),
+  x ~ deg_multtau + I(deg_multtau^2)+ I(deg_multtau^3)
+  )
+
+# Cox regressions
+formulas_taudegree_cox <- list(
+  Surv(time, status) ~ deg_multtau, 
+  Surv(time, status) ~ deg_multtau + I(deg_multtau^2),
+  Surv(time, status) ~ deg_multtau + I(deg_multtau^2)+ I(deg_multtau^3)
+  )
+```
+
+### Simulated data
+
+First, run regression models with new centrality measures on simulated epidemics.
+
+#### Linear models
+
+```{r}
+lin_models_taudegree <- lapply(tti, function(t) lapply(formulas_taudegree, function(u) {
+  x <<- t
+  fit <- lm(u)
+  r2 <- summary(fit)$adj.r.squared
+  rmse <- sqrt(mean(fit$residuals^2))
+  
+  list("r2" = r2, "rmse" = rmse)
+  })
+)
+
+saveRDS(lin_models_taudegree, "results/lin_models_taudegree.RDS")
+
+lin_models_r2_taudegree <- 
+  lapply(lin_models_taudegree, function(x) sapply(x, function(y) y[["r2"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "r2", names_prefix = "V",
+               names_transform = function(x) as.factor(as.integer(x)))
+
+lin_models_rmse_taudegree <- 
+  lapply(lin_models_taudegree, function(x) sapply(x, function(y) y[["rmse"]])) %>% 
+  do.call("rbind", .) %>% 
+  as.data.frame() %>% 
+  mutate(sim_no = row_number()) %>% 
+  pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
+               names_transform = function(x) as.factor(as.integer(x)))
+
+lin_models_measures_taudegree <- lin_models_r2_taudegree %>% 
+  full_join(lin_models_rmse_taudegree, by = c("sim_no", "model"))
+
+lin_models_summary_taudegree <- lin_models_measures_taudegree %>% 
+  mutate(r2_trans = fisher_z_transform(r2)) %>% 
+  group_by(model) %>% 
+  mutate(across(rmse, list(
+    mean = ~mean(.x),
+    sd = ~sd(.x))),
+    rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
+    rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
+  mutate(across(r2_trans, list(
+    mean = ~fisher_z_transform(mean(.x), back = TRUE),
+    sd = ~fisher_z_transform(sd(.x), back = TRUE),
+    cilow = ~fisher_z_transform((mean(.x) - 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                     back = TRUE),
+    cihigh = ~fisher_z_transform((mean(.x) + 1.96*(sd(.x)/sqrt(length(tti)))), 
+                                       back = TRUE)
+  ))) %>% 
+  select(-sim_no, -r2, -rmse, -r2_trans) %>% 
+  distinct()
+
+write_xlsx(lin_models_summary_taudegree, "results/lin_models_taudegree.xlsx")
+```
+
+#### Cox models
+
+```{r}
+surv_models_taudegree <- lapply(tti, function(x) {
+  # restructure data
+  df <- data.table(x) %>% 
+  mutate(time = x,
+         status = ifelse(is.na(.data$time), 0, 1)) %>%
+  mutate(time = ifelse(is.na(.data$time),
+                       max(.data$time, na.rm = TRUE), 
+                       .data$time),
+         deg_multtau = deg_multtau) %>% 
+  as.data.table()
+  
+  lapply(formulas_taudegree_cox, function(y) {
+    # run models and compute Uno's weighted concordance index
+    fit <- tryCatch(coxph(formula = y, data = df),
+                    error = function(e) {
+                      paste(e$message, y)
+                      FALSE},
+                    warning = function(w) {
+                      paste(w$message, y)
+                      FALSE
+                      })
+    
+    if (isFALSE(fit)) {
+      return("ci" = NA)
+    } else {
+      ci <- concordance(fit, timewt = "n/G2")
+      return(c("ci" = ci))
+    }
+
+  })
+}
+)
+
+# Get C from models, summarize over data sets 
+surv_models_ci_taudegree <- 
+  lapply(surv_models_taudegree, function(x) sapply(x, function(y) y[[1]])) %>%
+  do.call("rbind", .) %>%
+  as.data.frame() %>% 
+  rename_with(~ str_remove(.x, "V")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-26, names_to = "model", values_to = "value", 
+               names_transform = function(x) as.factor(as.integer(x))) %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(model) %>% 
+  summarise(convergence = sum(!is.na(value))/length(surv_models_taudegree)*100,
+            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                              back = TRUE)
+            )
+
+write_xlsx(surv_models_ci_taudegree, "results/surv_models_taudegree.xlsx")
+```
+
+
+### Test data
+
+Get and clean Covid-test data.
+
+```{r}
+# Read in data on individual Covid tests
+covid_dat <- as.data.table(read_spss(path_rivm))
+
+# Reduce to first positive case per person
+positives_dat <- covid_dat %>% 
+  lazy_dt(immutable = FALSE) %>% 
+  # remove without bsn
+  filter(RINPERSOONS == "R") %>% 
+  # add variables indicating time until infection
+  mutate(DatumMonsterafname = as.Date(DatumMonsterafname),
+         Testuitslag = Testuitslag != "NEGATIEF",
+         time_afname = as_datetime(paste(DatumMonsterafname, TijdstipMonsterafname)),
+         days_from_start = difftime(DatumMonsterafname, min(DatumMonsterafname), 
+                                    units = "days"),
+         weeks_from_start = as.integer(ceiling(days_from_start/7))) %>% 
+  # get only first positive result for every person
+  group_by(RINPERSOON) %>% 
+  filter(isTRUE(Testuitslag) & time_afname == min(time_afname)) %>% 
+  ungroup() %>% 
+  as.data.table()
+
+saveRDS(positives_dat, "data_processed/positive_cases.RDS")
+
+# Join time until infection with centrality measures
+test_dat <- positives_dat %>% 
+  inner_join(data.frame(
+    deg_multtau, deg_mult, eig_mult, pr_mult, "RINPERSOON" = nodes)
+    ) %>% 
+  mutate(across(ends_with("from_start"), as.integer))
+```
+
+Run linear regression models on Covid-test data.
+
+```{r}
+lin_models_taudegree_test <- lapply(formulas_taudegree, function(f) {
+  x <<- test_dat$weeks_from_start
+  r2 <- summary(lm(f, data = test_dat))$adj.r.squared
+  rmse <- sqrt(mean(lm(f, data = test_dat)$residuals^2))
+  
+  data.frame("r2" = r2, "rmse" = rmse)
+  })
+
+do.call("rbind", lin_models_taudegree_test) %>% 
+  mutate(model = row_number()) %>% 
+  write_xlsx("results/lin_models_taudegree_test.xlsx")
+```
+
+
