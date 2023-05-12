@@ -32,6 +32,7 @@ Author: **Christine Hedde-von Westernhagen, May 2023**
 | 📂`results/`            | stores results of analyses as displayed in `thesis_chw_v080523.pdf` (*empty*)   |
 | `analyses.Rmd`          | script describing and executing all data preparation and analyses               |
 | `aux_functions.R`       | script with auxiliary functions used in `analyses.Rmd`                          |
+| `session_info.txt`      | file containing R session info including package versions                       |
 | `thesis_chw_v080523.pdf`| manuscript of thesis as submitted on 8 May 2023                                 |
 
 
