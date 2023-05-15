@@ -14,7 +14,7 @@ Author: **Christine Hedde-von Westernhagen, May 2023**
 
 ***Please note:***
 
-- This repository is a publicly accessible version of my thesis project. It serves as a documentation of the performed analyses, so they can be reproduced if necessary. It also stores the final version of the manuscript. There is NO DATA stored in this repository due to privacy regulations.
+- This repository is a publicly accessible version of my thesis project. It will remain public on [GitHub](https://github.com/christine-hvw/thesis_disclosed/tree/main) as a documentation of the performed analyses, so they can be reproduced if necessary. It also stores the final version of the manuscript. There is NO DATA stored in this repository due to privacy regulations.
 
 - To reproduce results shown in the thesis manuscript (`thesis_chw_v080523.pdf`), all code in the file `analyses.Rmd` has to be executed after obtaining access to the original data ([info below](#data-access)).
 
@@ -28,8 +28,8 @@ Author: **Christine Hedde-von Westernhagen, May 2023**
 
 | Content                 | Description                                                                     |
 | ---------------------   | ---------------------------------------------------------------------------     |
-| 📂`data_processed/`     | stores intermediary data objects (*empty*)                                      |
-| 📂`results/`            | stores results of analyses as displayed in `thesis_chw_v080523.pdf` (*empty*)   |
+| 📂`data_processed/`     | stores intermediary data objects (*empty* because discloses individual data)    |
+| 📂`results/`            | stores results of analyses as displayed in `thesis_chw_v080523.pdf` as *.xlsx*  |
 | `analyses.Rmd`          | script describing and executing all data preparation and analyses               |
 | `aux_functions.R`       | script with auxiliary functions used in `analyses.Rmd`                          |
 | `session_info.txt`      | file containing R session info including package versions                       |
@@ -67,4 +67,4 @@ Covid tests:
 
 ### Contact
 
-For questions or comments please contact me via c.hedde-vonwesternahagen@students.uu.nl, or open an [issue](https://github.com/christine-hvw/thesis_disclosed/issues) in this repository.
+This repository is maintained by Christine Hedde-von Westernhagen. The maintainer is solely responsible for all contents. For questions or comments please get in touch via c.hedde-vonwesternahagen@students.uu.nl, or open an [issue](https://github.com/christine-hvw/thesis_disclosed/issues) in this repository.
