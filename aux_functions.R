@@ -1,17 +1,14 @@
-# _____________________________________________________________________________
-# title: "Predicting Covid-19 infections using multi-layer centrality measures"
-# subtitle: "Auxiliary functions"
-# author: "Christine Hedde-von Westernhagen"
-# date: "15-05-2023"
-# _____________________________________________________________________________
 
+# AUXILIARY FUNCTIONS
+# ____________________
 
-# Testing -----------------------------------------------------------------
-# # >>> UNCOMMENT THIS PART FOR TESTING OF FUNCTIONS <<<
 # Packages
 # library(muxViz)
 # library(Matrix)
 # library(igraph)
+# library(tidymodels)
+# library(doParallel)
+# library(vip)
 # 
 # # Test data and parameters
 # layers <- 4
@@ -33,14 +30,8 @@
 
 # Adaption of muxViz centrality functions ---------------------------------
 
-# All code based on the muxViz package (v3.1) as stated below has been acquired via 
-# https://github.com/manlius/muxViz, which is licensed and copyrighted under 
-# GNU General Public License v3.0.
-
 ## Degree centrality ------------------------------------------------------
 
-# Based on muxViz::GetMultiDegree()
-# - combines  GetMultiInDegree() and  GetMultiOutDegree(), uses adaption of binarizeMatrix()
 
 GetMultiDegree_edit <- function (SupraAdjacencyMatrix, Layers, Nodes, isDirected) {
   
@@ -85,11 +76,6 @@ GetMultiDegreeSum_edit <- function(SupraAdjacencyMatrix, Layers, Nodes, NodesTen
 }
 
 
-## Binarize matrix --------------------------------------------------------
-
-# Based on muxViz::binarizeMatrix()
-# - adaption necessary because it throws error with large matrices
-
 binarizeMatrix_edit <- function(SparseMat){
   
   SparseMat@x[SparseMat@x !=  0] <- 1
@@ -99,13 +85,10 @@ binarizeMatrix_edit <- function(SparseMat){
 
 ## Eigenvector centrality -------------------------------------------------
 
-# Based on muxViz::GetMultiEigenvectorCentrality()
-# - uses power method from GetLargestEigenv_edit() to find eigenvector centrality
 
 GetMultiEigenvectorCentrality_edit <- function(SupraAdjacencyMatrix, Layers, Nodes) {
   
-  LeadingEigenvector <- GetLargestEigenv_edit(SupraAdjacencyMatrix, Layers, Nodes, 
-                                              Type = "eigenvector")
+  LeadingEigenvector <- GetLargestEigenv_edit(SupraAdjacencyMatrix, Layers, Nodes, Type = "eigenvector")
   
   CentralityVector <- sumR(reshapeR(LeadingEigenvector, Nodes, Layers), 2)
   
@@ -116,14 +99,11 @@ GetMultiEigenvectorCentrality_edit <- function(SupraAdjacencyMatrix, Layers, Nod
 
 ## PageRank centrality ----------------------------------------------------
 
-# Based on muxViz::GetMultiEigenvectorCentrality()
-# - uses power method from GetLargestEigenv_edit() to find PageRank centrality
 
 GetMultiPageRankCentrality_edit <- function(SupraAdjacencyMatrix, Layers, Nodes,
                                             Method = "multilayer") {
   
-  LeadingEigenvector <- GetLargestEigenv_edit(SupraAdjacencyMatrix, Layers, Nodes, 
-                                              Type = "pagerank")
+  LeadingEigenvector <- GetLargestEigenv_edit(SupraAdjacencyMatrix, Layers, Nodes, Type = "pagerank")
   
   CentralityVector <- LeadingEigenvector/sum(LeadingEigenvector)
   
@@ -137,50 +117,28 @@ GetMultiPageRankCentrality_edit <- function(SupraAdjacencyMatrix, Layers, Nodes,
 }
 
 
-## Get largest eigenvector ------------------------------------------------
-
-# Replaces muxViz::GetLargestEigenv() in Eigenv. and PageRank centrality functions
-# - power method is used which facilitates finding eigenvectors in large matrices
-
 GetLargestEigenv_edit <- function(SupraAdjacencyMatrix, Layers, Nodes, Type = "eigenvector") {
   
-  # Initial guess of (normalized) eigenvector
-  weight <- rep(1, Nodes * Layers)/(Nodes * Layers)
+  weight <- rep(1, Nodes*Layers)/(Nodes*Layers)
   
-  # For PageRank centrality
+  # For pagerank
   if(Type == "pagerank") {
-    
-    # Get transition matrix of supra adjacency matrix
     M_hat <- BuildSupraTransitionMatrixFromSupraAdjacencyMatrix_edit(SupraAdjacencyMatrix)
-    
-    # Add PageRank factor
-    M_hat_add <- Matrix(0.85 * M_hat, sparse = TRUE)
-    
-    extra <- rep(0.15, Nodes * Layers)/(Nodes * Layers)
-    
-  # For normal eigenvector don't add anything
+    M_hat_add <- Matrix(0.85*M_hat, sparse = TRUE)
+    extra <- rep(0.15, Nodes*Layers)/(Nodes*Layers)
+  # For normal eigenvector
   } else if(Type == "eigenvector"){
-    
     M_hat_add <- SupraAdjacencyMatrix
-    
     extra <- rep(0, Nodes*Layers)
   }
   
-  # Repeatedly multiply eigenvector guess with adjacency matrix
-  # (using commutative property)
   for (i in 1:100) {
-    
     weight <-  (weight %*% M_hat_add)  + (weight %*% extra)[1,1]
   }
   
   return(weight)
 }
 
-
-## Supra-transition matrix ------------------------------------------------
-
-# Reduced version of muxViz::BuildSupraTransitionMatrixFromSupraAdjacencyMatrix()
-# - used in combination with adapted functions for Eigenv. and PageRank centrality
 
 BuildSupraTransitionMatrixFromSupraAdjacencyMatrix_edit <- function(SupraAdjacencyMatrix) {
   
@@ -192,29 +150,24 @@ BuildSupraTransitionMatrixFromSupraAdjacencyMatrix_edit <- function(SupraAdjacen
 }
 
 
-## Tau-weighted multi-layer Degree centrality ------------------------------
+# tau-weighted multi-layer degree centrality ------------------------------
 
-# Version of multi-layer Degree centrality with layer specific weighting ("Taus")
 
 GetMultiTauDegree <- function(SupraAdjacencyMatrix, Layers, Nodes, Taus){
   
   NodesTensor <- SupraAdjacencyToNodesTensor(binarizeMatrix_edit(SupraAdjacencyMatrix), 
                                              Layers, Nodes)
   
-  # Create storage
   DegreeMatrix <- Matrix(data = 0, nrow = Nodes, ncol = Layers)
   
   for (l in 1:Layers) {
-    # Compute in- and out-degree
     MultiInDegreeVector <- Matrix::t(sumR(NodesTensor[[l]], 1))
     
     MultiOutDegreeVector <- sumR(NodesTensor[[l]], 2)
     
-    # Weight Degree by layer
     DegreeMatrix[,l] <- Taus[l] * ((MultiInDegreeVector + MultiOutDegreeVector)/2)
   }
   
-  # Get sum of weighted Degrees
   MultiTauDegree <- Matrix::rowSums(DegreeMatrix)
   
   return(MultiTauDegree)
@@ -237,29 +190,28 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, step_size = 7,
   # verbose = print iterations of while loop?
   # out = return value: sir_mat, time_to_inf, tti_duration, all
   
-  # Set up parameters and storage for infection status groups
   layers <- length(adj_mats)
   N <- dim(adj_mats[[1]])[1]
   S <- Matrix(rep(1, N), nrow = N, ncol = 1, sparse = TRUE)
   I <- Matrix(rep(0, N), nrow = N, ncol = 1, sparse = TRUE)
   R <- Matrix(rep(0, N), nrow = N, ncol = 1, sparse = TRUE)
   
-  # Sample seed infections
+  # sample seed infections
   if(!is.null(random_seed)) set.seed(random_seed)
   
   I1 <- sample(1:N, size = seed_infs)
   
-  # Change status of seed nodes
+  # change status of seed nodes
   S[I1,1] <- 0
   I[I1,1] <- 1
   
-  # Set recovery time sampled from Weibull distribution per individual
+  # set recovery time sampled from Weibull distribution per individual
   rec_time <- rweibull(N, scale = gamma, shape = 1)
   
-  # Storage for new infections per layer
+  # storage for new infections per layer
   newI_layers <- vector(mode = "list", length = layers)
   
-  # While there are still people infected, i.e., not recovered & t <= t_max...
+  # while there are still people infected, i.e., not recovered & t <= t_max...
   t <- 1
   while (sum(I[,t]) > 0 & t <= t_max) {
     
@@ -290,40 +242,50 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, step_size = 7,
     nextR <- R[,t-1] + newR
     
     # collect old and new observations for each group
-    # (3 matrices of N x t)
     S <- cbind(S, nextS)
     I <- cbind(I, nextI)
     R <- cbind(R, nextR)
   }
   
-  # Collect all status group matrices
   SIR <- list(S = S, I = I, R = R)
   
-  # RETURN based on "out" argument
+  # RETURN based on out argument
   switch (out,
-    
-    # complete matrices of infection status over time
     sir_mat = return(SIR),
     
-    # times to infection, Inf if not infected
+    epi_curves = {
+      cum_S <- unname(apply(SIR$S, 2, sum))
+      cum_I <- unname(apply(SIR$I, 2, sum))
+      cum_R <- unname(apply(SIR$R, 2, sum))
+      return(list("S" = cum_S, "I" = cum_I, "R" = cum_R))},
+    
     time_to_inf = {
+      # compute times to infection, Inf if not infected
       s_times <- rowSums(S)
       s_times[s_times == ncol(S)] <- Inf
       return(s_times)},
     
-    # duration of epidemic
     duration = {
+      # duration of epidemic
       duration <- ncol(S)
       return(duration)},
     
-    # both tti and duration
     tti_duration = {
       s_times <- rowSums(S)
       s_times[s_times == ncol(S)] <- Inf
       duration <- ncol(S)
       return(list("time_to_inf" = s_times, "duration" = duration))},
     
-    # all of the above
+    tti_duration_epi = {
+      s_times <- rowSums(S)
+      s_times[s_times == ncol(S)] <- Inf
+      duration <- ncol(S)
+      cum_S <- unname(apply(SIR$S, 2, sum))
+      cum_I <- unname(apply(SIR$I, 2, sum))
+      cum_R <- unname(apply(SIR$R, 2, sum))
+      return(list("time_to_inf" = s_times, "duration" = duration,
+                  "S" = cum_S, "I" = cum_I, "R" = cum_R))},
+    
     all = {
       s_times <- rowSums(S)
       s_times[s_times == ncol(S)] <- Inf
@@ -335,8 +297,6 @@ model_sir_multiplex <- function(adj_mats, tau, gamma, step_size = 7,
 
 
 # Variable transformations ------------------------------------------------
-
-# Perform a Fisher z-transformation to normality on a variable (or back-transformation)
 
 fisher_z_transform <- function(coef, back = FALSE) {
   # coef = the correlation coefficient to be transformed
@@ -354,6 +314,128 @@ fisher_z_transform <- function(coef, back = FALSE) {
   
   
 
+# XGBoost modeling pipeline -----------------------------------------------
+
+xgb_pipeline <- function(seed = 9106, 
+                         predictors, outcome, 
+                         #sample_size, 
+                         eval_metric = "rmse",
+                         objective = "reg:squarederror",
+                         hyperparams = NULL,
+                         train_prop = 0.1) {
+  # seed: random seed
+  # predictors, outcome: named vectors of variables
+  # sample_size: subset of dataset to be used
+  # eval_metric: rmse or rsq, e.g., leave out for cox
+  # objective: reg:squarederror or survival:cox
+  # hyperparams: either NULL to tune within function, or specified hyperparams.
+  
+  set.seed(seed)
+  
+  # Data assembly
+  xgb_dat <- 
+    data.frame(predictors, outcome) %>% 
+    drop_na() #%>% 
+    #slice_sample(n = sample_size) 
+  
+  # Data split
+  xgb_split <- initial_split(xgb_dat, prop = train_prop)
+  xgb_train <- training(xgb_split)
+  
+  # Hyperparameter specs
+  xgb_spec <- boost_tree(
+    mode = "regression",
+    trees = tune(),
+    tree_depth = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    mtry = length(predictors),
+    learn_rate = tune()
+    ) %>% 
+    set_engine("xgboost", 
+               objective = objective)
+  
+  # do tuning if no hyeperparams. are given
+  if(is.null(hyperparams)) {
+  
+    # Tuning grid (space-filling search design)
+    xgb_grid <- grid_latin_hypercube(
+      trees(range = c(100, 1000)),
+      tree_depth(range = c(2,5)),
+      min_n(),
+      loss_reduction(),
+      sample_size = sample_prop(range = c(0.2, 0.9)),
+      learn_rate(),
+      size = 50
+    )
+    
+    # Workflow
+    xgb_wf <- workflow() %>% 
+      add_formula(tti ~.) %>% 
+      add_model(xgb_spec)
+    
+    # Create CV folds
+    xgb_folds <- vfold_cv(xgb_train)
+    
+    # Do the tuning
+    all_cores <- parallel::detectCores()
+    
+    cl <- makePSOCKcluster(all_cores)
+    registerDoParallel(cl)
+    
+    xgb_res <- tune_grid(
+      xgb_wf,
+      resamples = xgb_folds,
+      grid = xgb_grid,
+      control = control_grid(save_pred = FALSE)
+    )
+  
+    stopCluster(cl)
+    
+    env <- foreach:::.foreachGlobals
+    rm(list = ls(name = env), pos = env)
+    
+    # Select model with best hyperparameter combination
+    best_params <- select_best(xgb_res, metric = eval_metric)
+
+  } else {
+    
+    xgb_wf <- workflow() %>% 
+      add_formula(tti ~.) %>% 
+      add_model(xgb_spec)
+    
+    best_params <- hyperparams
+  }
+  
+  # Add hyperparams. to workflow
+  xgb_final <- finalize_workflow(xgb_wf, best_params)
+  
+  # Fit best model on training data and evaluate on test data
+  xgb_res_final <- last_fit(xgb_final, xgb_split)
+  
+  # Get performance metrics
+  metrics_final <- collect_metrics(xgb_res_final)
+  
+  # Get variable importance measures
+  # (no work when data too small)
+  vi <- tryCatch(xgb_res_final %>% 
+                   extract_workflow() %>%
+                   extract_fit_engine() %>%
+                   xgb.importance(model = .),
+                  error = function(e) {
+                    paste(e$message)
+                    FALSE},
+                  warning = function(w) {
+                    paste(w$message)
+                    FALSE
+                    })
+  
+  return(list("model_params" = best_params,
+              "metrics" = metrics_final, 
+              "vimportance" = vi,
+              "last_fit" = extract_workflow(xgb_res_final)))
+}
 
 
   

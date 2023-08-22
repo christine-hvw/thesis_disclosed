@@ -1,49 +1,42 @@
 ---
 title: "Predicting Covid-19 infections using multi-layer centrality measures"
-subtitle: "Analysis script"
+subtitle: "Master Thesis"
 author: "Christine Hedde-von Westernhagen"
-date: "15-05-2023"
+date: "`r Sys.Date()`"
 output: html_document
 ---
-
->> This file describes and executes all data preparation and analyses conducted for the thesis project. 
-
->> Intermediary data objects are stored in the `data_processed` folder.
-
->> Tables with analysis results are stored in the `results` folder. 
-
->> For more info see README.md.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
-library(haven)      # importing spss files
-library(data.table) # fast data reading and manipulation
-library(dtplyr)     # data.table interface to dplyr
-library(tidyverse)  # packages for data wrangling
-library(muxViz)     # multi-layer network operations
-library(Matrix)     # for sparse matrices
-library(igraph)     # single-layer network operations
-library(writexl)    # results need to be exported to excel
-library(survival)   # Cox regressions
+library(haven)
+library(data.table)
+library(dtplyr)
+library(tidyverse)
+library(scales)
+library(muxViz)
+library(Matrix)
+library(ggplot2)
+library(igraph)
+library(patchwork)
+library(writexl)
+library(survival)
+library(tidymodels)
+library(vip)
+library(doParallel)
 
-# Import custom auxiliary functions
 source("aux_functions.R")
 ```
 
-
 # Data prep
-
-## File paths
 
 Save important file paths to CBS data.
 
 - network data: G:/Bevolking/PN/
 - schools and their locations: G:/Onderwijs/BRINADRESSEN/
 - registered students: G:/Onderwijs/INSCHRWPOTAB/
-- Covid tests: G:/Maatwerk/CORONIT/CoronIT_GGD_testdata_20210921.sav
 
-Linktypes in network data:
+Linktypes 
 
 - 101	tante/oom	familie
 - 102	co-ouder	familie
@@ -70,8 +63,6 @@ Linktypes in network data:
 
 
 ```{r}
-# Define all file paths and variables of interest within files
-
 path_pn <- "G:/Bevolking/PN/"
 
 files_pn <- c("family_edges" = "PersNw2018_v1.0_links_familie.csv",
@@ -116,13 +107,13 @@ Read the school and student data, merge students with schools, filter data:
 - only gemeente Amsterdam
 
 ```{r}
-# Read school addresses and individual education data 
+# read school addresses and individual education data 
 brinadressen_dat <- as.data.table(read_spss(paste0(path_brinadressen, files_brinadressen)))
 
 education_dat <- as.data.table(read_spss(paste0(path_education, files_education), 
                                          col_select = all_of(vars_education)))
 
-# Merge education records and location of schools 
+# merge education records and location of schools 
 eduadress_dat <-  education_dat %>% 
   left_join(brinadressen_dat, by = c("WPOBRIN_crypt" = "BRIN_crypt", 
                                      "WPOBRINVEST" = "BRINVest")) %>% 
@@ -131,131 +122,267 @@ eduadress_dat <-  education_dat %>%
   # filter gemeente Amsterdam
   mutate(POSTCODE = as.numeric(POSTCODE)) %>% 
   filter(POSTCODE %in% c(1000:1109)) %>% 
-  # get variables of interest
   select(any_of(c(vars_education, vars_brinadressen))) %>% 
   as.data.table()
+
+rm(brinadressen_dat, education_dat)
 ```
 
-Create school edgelist by joining student data with "itself", i.e., adding classmates based on "WPOBRIN_crypt" and "WPOLEERJAAR".
+Create school edgelist
 
 ```{r}
 school_edges <- eduadress_dat %>%
   select(from = RINPERSOON, WPOBRIN_crypt, WPOLEERJAAR) %>%
-  # add classmates
-  left_join(distinct(eduadress_dat[,c("RINPERSOON", "WPOBRIN_crypt", "WPOLEERJAAR")])) %>%
+  # add schoolmates (many-to-many relationships expected)
+  left_join(eduadress_dat[,c("RINPERSOON", "WPOBRIN_crypt", "WPOLEERJAAR")]) %>%
   rename("to" = "RINPERSOON") %>%
   # delete self-edges
   filter(from != to) %>%
   as.data.table()
 
 students <- unique(c(school_edges$from, school_edges$to))
+
+rm(eduadress_dat)
 ```
 
-Read in edgelists for other layers and reduce to student sample:
+Read in edge lists for other layers and reduce to student sample:
 
 ## Families
 
-Keep only parent-child, and sibling relations for this layer.
-
 ```{r}
-# Read in family edges
+# Family edges
 family_edges <- fread(file = paste0(path_pn, files_pn["family_edges"]), 
-                      verbose = TRUE, colClasses = list(character = 1:4))
+                      verbose = FALSE, colClasses = list(character = 1:4))
 
-# Get edge attributes (and select subset: parents-children-siblings)
+
+# Edge attributes (and selected subset: parents-children-siblings)
 link_labels <- fread(file = paste0(path_pn, files_pn["edge_labels"]), verbose = FALSE)
-keep_codes <- c(103, 104, 107, 109, 111)
+keep_codes <- c(102, 103, 104, 107)
 
-# Subset family edges to relations of interest and sampled students
-family_edges_sub <- family_edges %>%
+# subset to relations of interest and sampled students
+# first get ties of students to parents and siblings
+family_edges_sub1 <- family_edges %>%
   filter((linktype %in% keep_codes) &
          (RINPERSOONSRC %in% students | RINPERSOONDST %in% students)) %>%
   as.data.table()
 
-rm(family_edges)
+# ...then add ties between parents
+family_edges_sub2 <- family_edges %>%
+  filter(linktype == 102 &
+         (RINPERSOONSRC %in% c(family_edges_sub1$RINPERSOONSRC, family_edges_sub1$RINPERSOONDST) | 
+          RINPERSOONDST %in% c(family_edges_sub1$RINPERSOONSRC, family_edges_sub1$RINPERSOONDST))) %>% 
+  bind_rows(family_edges_sub1) %>% 
+  distinct()
+  
+# ...then between parents and siblings
+parents <- family_edges_sub1 %>% 
+  filter(linktype == 104) %>% 
+  pull(RINPERSOONSRC) %>% 
+  unique()
 
-# Make sure all students are also part of the family network ~ PN data is from 2018, school data 2020
-# (this also has to be done for households) 
+siblings <- family_edges_sub1 %>% 
+  filter(linktype == 103) %>% 
+  pull(RINPERSOONSRC) %>% 
+  unique()
+
+family_edges_sub3 <- family_edges %>%
+  filter((linktype == 104 & RINPERSOONSRC %in% parents & RINPERSOONDST %in% siblings) |
+           (linktype == 107 & RINPERSOONSRC %in% siblings & RINPERSOONDST %in% parents)) %>% 
+  bind_rows(family_edges_sub2) %>% 
+  distinct()
+
+family_edges_sub <- family_edges_sub3
+
+saveRDS(family_edges_sub, "temp/family_edges_sub.RDS")
+
+rm(family_edges, family_edges_sub1, family_edges_sub2, family_edges_sub3)
+
+# make sure all students are also part of the family network ~ PN data is from 2018, school data 2020
 school_edges_sub <- school_edges %>%
   filter(from %in% c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST) &
            to %in% c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST)) %>%
   as.data.table()
 
-# Update student list
+# update student list
 students <- unique(c(school_edges_sub$from, school_edges_sub$to))
+# also make list with all nodes so far
+node_list <- unique(c(family_edges_sub$RINPERSOONSRC,family_edges_sub$RINPERSOONDST))
 ```
+
+<!---- Checking if network layer was built correctly
+
+```{r}
+groups <- c("family", "school", "household", "work")
+layers <- length(groups)
+node_tensor <- list()
+g_list <- list()
+```
+
+```{r}
+g_list[["family"]] <- 
+  graph_from_data_frame(family_edges_sub[, c("RINPERSOONSRC", "RINPERSOONDST")],
+                        directed = TRUE)
+  
+# adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
+node_tensor[["family"]] <- as_adjacency_matrix(g_list[["family"]])
+  
+# get final undirected graph
+g_list[["family"]] <- graph_from_adjacency_matrix(node_tensor[["family"]],
+                                                  mode = "undirected",
+                                                  weighted = TRUE)
+
+
+transitivity(g_list[["family"]])
+
+summary(transitivity(g_list[["family"]], type = "local"))
+hist(transitivity(g_list[["family"]], type = "local"))
+
+sum(transitivity(g_list[["family"]], type = "local")<1, na.rm = TRUE)
+
+sort(components(g_list[["family"]])$csize, decreasing = TRUE)
+count_components(g_list[["family"]])
+max(ego_size(g_list[["family"]], order = 3))
+```
+--->
+
 
 ## Households
 
-Basically same procedure as for family relations.
-
 ```{r}
-# Read in household edges
 household_edges <- fread(file = paste0(path_pn, files_pn["household_edges"]), 
-                         verbose = TRUE, colClasses = list(character = 1:4))
+                         verbose = FALSE, colClasses = list(character = 1:4))
 
-# Add partners and co-cohabitants as desired links
+# add partners and co-cohabitants as desired links
 keep_codes <- c(keep_codes, 201, 202, 203)
 
-# Subset household edges to relations of interest and sampled students
-household_edges_sub <- household_edges %>% 
+# ties of students
+household_edges_sub1 <- household_edges %>% 
   filter((linktype %in% keep_codes) &
          (RINPERSOONSRC %in% students | RINPERSOONDST %in% students)) %>% 
   as.data.table()
 
-rm(household_edges)
+# add ties of student hh contacts
+household_edges_sub2 <- household_edges %>% 
+  filter((linktype %in% keep_codes) &
+         (RINPERSOONSRC %in% c(household_edges_sub1$RINPERSOONSRC, 
+                               household_edges_sub1$RINPERSOONDST) |
+          RINPERSOONDST %in% c(household_edges_sub1$RINPERSOONSRC, 
+                               household_edges_sub1$RINPERSOONDST))) %>% 
+  bind_rows(household_edges_sub1) %>% 
+  distinct() %>% 
+  as.data.table()
 
-# Make sure all students are also part of the household network ~ PN data is from 2018, school data 2020
+household_edges_sub <- household_edges_sub2
+
+saveRDS(household_edges_sub, "temp/household_edges_sub.RDS")
+
+rm(household_edges, household_edges_sub1, household_edges_sub2)
+
+# make sure all students are also part of the household network ~ PN data is from 2018, school data 2020
 school_edges_sub <- school_edges_sub %>% 
   filter(from %in% c(household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST) &
            to %in% c(household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST)) %>% 
   as.data.table()
 
-# Get students that were removed in previous step
+# get students that were removed in previous step
 hh_remove <- students[!students %in% unique(c(school_edges_sub$from, school_edges_sub$to))]
 
-# Make family edgelist a graph to get neighbors of removed nodes
+# make family edgelist a graph to get neighbors of removed nodes
 family_edges_sub_g <- family_edges_sub %>%
   select(RINPERSOONSRC, RINPERSOONDST) %>% 
   as.data.frame() %>% 
   as.matrix() %>% 
   graph_from_edgelist()
 
-neighs <- sapply(hh_remove, neighbors, graph = family_edges_sub_g)
-neighs <- sapply(1:length(neighs), function(x) names(neighs[[x]]))
+neighs_fam <- sapply(hh_remove, neighbors, graph = family_edges_sub_g)
+neighs_fam <- sapply(1:length(neighs_fam), function(x) names(neighs_fam[[x]]))
 
-# Remove persons from family network based on student non-presence in HH network
+# remove persons from family network based on student non-presence in HH network
 family_edges_sub <- family_edges_sub %>% 
-  filter(!(RINPERSOONSRC %in% c(hh_remove, neighs) | RINPERSOONDST %in% c(hh_remove, neighs))) %>% 
+  filter(!(RINPERSOONSRC %in% c(hh_remove, neighs_fam) | 
+             RINPERSOONDST %in% c(hh_remove, neighs_fam))) %>% 
   as.data.table()
+
+rm(family_edges_sub_g, neighs_fam)
+
+# # same for household layer 
+# hh_edges_sub_g <- household_edges_sub %>%
+#   select(RINPERSOONSRC, RINPERSOONDST) %>%
+#   as.data.frame() %>%
+#   as.matrix() %>%
+#   graph_from_edgelist()
+# 
+# neighs_hh <- sapply(hh_remove, neighbors, graph = hh_edges_sub_g)
+# neighs_hh <- sapply(1:length(neighs_hh), function(x) names(neighs_hh[[x]]))
+# 
+# household_edges_sub <- household_edges_sub %>% 
+#   filter(!(RINPERSOONSRC %in% c(hh_remove, neighs_hh) |
+#              RINPERSOONDST %in% c(hh_remove, neighs_hh))) %>% 
+#   as.data.table()
+
+# --- not necessary, because...
+any(hh_remove %in% V(hh_edges_sub_g)) # == FALSE
+
+# update student list
+students <- unique(c(school_edges_sub$from, school_edges_sub$to))
+# also make list with all nodes so far
+node_list <- unique(c(node_list, 
+                      household_edges_sub$RINPERSOONSRC, 
+                      household_edges_sub$RINPERSOONDST))
 ```
+
+<!---- Checking if network layer was built correctly
+```{r}
+g_list[["household"]] <- 
+  graph_from_data_frame(household_edges_sub[, c("RINPERSOONSRC", "RINPERSOONDST")],
+                        directed = TRUE)
+  
+# adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
+node_tensor[["household"]] <- as_adjacency_matrix(g_list[["household"]])
+  
+# get final undirected graph
+g_list[["household"]] <- graph_from_adjacency_matrix(node_tensor[["household"]],
+                                                     mode = "undirected",
+                                                     weighted = TRUE)
+transitivity(g_list[["household"]])
+
+summary(transitivity(g_list[["household"]], type = "local"))
+ 
+sort(components(g_list[["household"]])$csize, decreasing = TRUE)
+count_components(g_list[["household"]])
+```
+--->
 
 ## Workplaces
 
-Co-worker edges are added to all nodes present in the network up to this point. Relations need to be made symmetric first.
-
 ```{r}
-# Read in work edges
-work_edges <- fread(file = paste0(path_pn, files_pn["work_edges"]), 
-                    verbose = TRUE, colClasses = list(character = 1:4))
+work_edges <- fread(file = paste0(path_pn, files_pn["work_edges"]),
+                    verbose = FALSE, colClasses = list(character = 1:4))
 
-# Add coworkers as desired links
 keep_codes <- c(keep_codes, 401, 402)
 
-# Get ids of nodes in network so far
-nodes_nowork <- unique(c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST,
-                         household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST,
-                         school_edges_sub$RINPERSOONSRC, school_edges_sub$RINPERSOONDST))
-
-# Filter for nodes already included in network as source nodes
-work_edges_sub <- work_edges %>% 
+# filter for nodes already included in network as source nodes
+work_edges_sub1 <- work_edges %>% 
   filter((linktype %in% keep_codes) &
-         (RINPERSOONSRC %in% nodes_nowork |
-           RINPERSOONDST %in% nodes_nowork)
+         (RINPERSOONSRC %in% node_list |
+           RINPERSOONDST %in% node_list)
          ) %>% 
   as.data.table()
 
-# Get asymmetric relationships
+# add ties between neighbors of source nodes
+work_edges_sub <- work_edges %>% 
+  filter((linktype %in% keep_codes) &
+         (RINPERSOONSRC %in% c(work_edges_sub1$RINPERSOONSRC, 
+                               work_edges_sub1$RINPERSOONDST) |
+          RINPERSOONDST %in% c(work_edges_sub1$RINPERSOONSRC, 
+                               work_edges_sub1$RINPERSOONDST))) %>% 
+  bind_rows(work_edges_sub1) %>% 
+  distinct() %>% 
+  as.data.table()
+
+saveRDS(work_edges_sub, "temp/work_edges_sub.RDS")
+
+# get asymmetric relationships
 work_edges_asym <- work_edges_sub %>% 
   # check and filter for asymmetric relations
   mutate(fromto = paste(RINPERSOONSRC, RINPERSOONDST, sep = "-"),
@@ -267,46 +394,68 @@ work_edges_asym <- work_edges_sub %>%
   select(-c(6:7)) %>% 
   as.data.table()
 
-# Add reverse relationships of asymmetrical ties to create symmetric data
+# add reverse relationships of asymmetrical ties to create symmetric data
 work_edges_sym <- work_edges_sub %>% 
-  bind_rows(work_edges_asym)
+  bind_rows(work_edges_asym) %>% 
+  distinct()
 
-rm(work_edges)
+saveRDS(work_edges_sym, "temp/work_edges_sym.RDS")
+
+# update nodelist
+node_list <- unique(c(node_list, 
+                      work_edges_sym$RINPERSOONSRC, 
+                      work_edges_sym$RINPERSOONDST))
+
+rm(work_edges, work_edges_sub1, work_edges_asym)
 ```
 
-Save all edgelists as intermediary files, so they can quickly be accessed again.
+<!---- Checking if network layer was built correctly
+```{r}
+# From here on treat work_edges_sym as work_edges_sub
+work_edges_sub <- work_edges_sym
+rm(work_edges_sym)
+
+g_list[["work"]] <- 
+  graph_from_data_frame(work_edges_sub[, c("RINPERSOONSRC", "RINPERSOONDST")],
+                        directed = TRUE)
+  
+# adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
+node_tensor[["work"]] <- as_adjacency_matrix(g_list[["work"]])
+  
+# get final undirected graph
+g_list[["work"]] <- graph_from_adjacency_matrix(node_tensor[["work"]],
+                                                     mode = "undirected",
+                                                     weighted = TRUE)
+transitivity(g_list[["work"]])
+
+summary(transitivity(g_list[["work"]], type = "local"))
+
+sort(components(g_list[["work"]])$csize, decreasing = TRUE)
+count_components(g_list[["work"]])
+```
+--->
+
+Save all intermediary edgelists.
 
 ```{r}
 saveRDS(school_edges_sub, "data_processed/school_edges_sub.RDS")
 saveRDS(family_edges_sub, "data_processed/family_edges_sub.RDS")
 saveRDS(household_edges_sub, "data_processed/household_edges_sub.RDS")
-# Because they take long to create, save both work edgelists, just in case
 saveRDS(work_edges_sub, "data_processed/work_edges_sub.RDS")
 saveRDS(work_edges_sym, "data_processed/work_edges_sym.RDS")
 ```
 
 ## Make multi-layer network
 
-Based on the individual layers created above, make a multi-layer network object. This has 4 ingredients:
-
-- node tensor: the collection of edge lists created above -> defines *intra*-layer relations
-- layer tensor: defines *inter*-layer relations, here categorical couplings because multiplex
-- no. layers (implicit from layer tensor and node tensor)
-- no. observations in each layer: here same across layers because multiplex
-
-Result: supra-adjacency matrix of the multi-layer network
-
 ```{r}
-# From here on treat work_edges_sym as work_edges_sub for conformity with other data
+# From here on treat work_edges_sym as work_edges_sub
 work_edges_sub <- work_edges_sym
 rm(work_edges_sym)
 
 # Define network characteristics
 groups <- c("family", "school", "household", "work")
 layers <- length(groups)
-nodes <- unique(c(family_edges_sub$RINPERSOONSRC, family_edges_sub$RINPERSOONDST,
-                  household_edges_sub$RINPERSOONSRC, household_edges_sub$RINPERSOONDST,
-                  work_edges_sub$RINPERSOONSRC, work_edges_sub$RINPERSOONDST))
+nodes <- node_list
 obs <- length(nodes) 
 
 # Rename school edge variables for conformity
@@ -314,22 +463,28 @@ school_edges_sub <- school_edges_sub %>%
   rename(RINPERSOONSRC = from, RINPERSOONDST = to) %>% 
   as.data.table()
 
+saveRDS(school_edges_sub, "temp/school_edges_sub.RDS")
+
+
 # Create node tensor
 node_tensor <- list()
 g_list <- list()
 
 for (g in groups) {
+ 
+  print(g)
   # get edgelist for group from global env.
   group <- get(paste(g, "edges_sub", sep = "_"))
-  
-  # first get directed graph since that's the format of the edgelists (undirected -> edges counted twice)
+
+  # first get directed graph since that's the format of the edgelists 
+  # (undirected -> edges counted twice)
   g_foo <- graph_from_data_frame(d = group[, c("RINPERSOONSRC", "RINPERSOONDST")],
                                  vertices = nodes,
                                  directed = TRUE)
-  
+
   # adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
   node_tensor[[g]] <- as_adjacency_matrix(g_foo)
-  
+
   # get final undirected graph
   g_list[[g]] <- graph_from_adjacency_matrix(node_tensor[[g]],
                                              mode = "undirected",
@@ -337,6 +492,7 @@ for (g in groups) {
   rm(group, g_foo)
 }
 
+saveRDS(node_tensor, "temp/node_tensor.RDS")
 saveRDS(node_tensor, "data_processed/node_tensor.RDS")
 
 # Define multiplex layer tensor
@@ -345,27 +501,63 @@ layer_tensor <- Matrix(c(0, 1, 1, 1,
                          1, 1, 0, 1,
                          1, 1, 1, 0), ncol = layers, sparse = TRUE)
 
-# >>> Make a supra-adjacency matrix <<<
+# Make a supra-adjacency matrix
 M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor, layers, obs)
 
+saveRDS(M, "temp/M.RDS")
 saveRDS(M, "data_processed/M.RDS")
-```
 
-Also make single-layer network for comparative analyses.
-
-```{r}
-# Adjacency matrix
+# Make collapsed single-layer network from node tensor
 adj_all <- node_tensor[[1]] + node_tensor[[2]] + node_tensor[[3]] + node_tensor[[4]]
 
-# Graph object
 g_all <- graph_from_adjacency_matrix(adj_all, mode = "undirected", weighted = TRUE)
+saveRDS(g_all, "temp/g_all.RDS")
+```
+
+Reduce to largest component. Would not be necessary if parents of "removed" students in family layer step had been removed before.
+
+```{r}
+count_components(g_all)
+components(g_all)$csize
+
+largcomp <- largest_component(g_all)
+
+not_largcomp <- setdiff(V(g_all)$name, V(largcomp)$name)
+
+node_list <- node_list[!node_list %in% not_largcomp]
+nodes <- node_list
+obs <- length(nodes) 
+
+for (g in groups) {
+ 
+  print(g)
+  
+  # delete vertices outside largest component
+  g_list[[g]] <- delete_vertices(g_list[[g]], v = not_largcomp)
+
+  # get correct node tensor
+  node_tensor[[g]] <- as_adjacency_matrix(g_list[[g]])
+}
+
+# Make a supra-adjacency matrix
+M <- BuildSupraAdjacencyMatrixFromEdgeColoredMatrices(node_tensor, layer_tensor, layers, obs)
+
+saveRDS(M, "temp/M.RDS")
+saveRDS(M, "data_processed/M.RDS")
+
+# Make collapsed single-layer network from node tensor
+adj_all <- node_tensor[[1]] + node_tensor[[2]] + node_tensor[[3]] + node_tensor[[4]]
+
+g_all <- graph_from_adjacency_matrix(adj_all, mode = "undirected", weighted = TRUE)
+
+count_components(g_all)
+
+saveRDS(g_all, "temp/g_all.RDS")
+
+rm(largcomp, not_largcomp)
 ```
 
 # Descriptive statistics network
-
-Get descriptive statistics of the individual network layers and the aggregate.
-
-> Results: Table 1 in manuscript
 
 ```{r}
 # Construct graph for each layer as above, BUT not including all nodes in all layers
@@ -374,10 +566,13 @@ g_list_lwise <- lapply(groups, function(g) {
   group <- get(paste(g, "edges_sub", sep = "_"))
   
   # first get directed graph since that's the format of the edgelists 
-  # (undirected -> edges counted twice)
+  #(undirected -> edges counted twice)
   g_foo <- graph_from_data_frame(d = group[, c("RINPERSOONSRC", "RINPERSOONDST")],
                                  # NOT include all nodes this time
                                  directed = TRUE)
+  
+  # delete vertices not in largest component 
+  g_foo <- delete_vertices(g_foo, v = not_largcomp)
   
   # adjacency matrix of that graph is equivalent to that of an undirected g. since symmetric
   adj_mat <- as_adjacency_matrix(g_foo)
@@ -395,13 +590,20 @@ desc_list <- lapply(c(g_list_lwise, "aggregate" = list(g_all)), function(x) {
   n <- vcount(x)
   edges <- ecount(x)
   clust <- transitivity(x, type = "global")
+  comps <- count_components(x)
+  largcomp <- length(largest_component(x))
   deg <- degree(x)
   
-  return(data.frame("nodes" = n, "edges" = edges, "clustering" = clust, 
+  return(data.frame("nodes" = n, 
+                    "edges" = edges, 
+                    "clustering" = clust, 
+                    "components" = comps,
+                    "pct_largcomp" = largcomp/n*100,
                     "p05_degree" = quantile(deg, probs = 0.05), 
                     "p05_degree_n" = sum(deg == quantile(deg, probs = 0.05)),
                     "mean_degree" = mean(deg), 
-                    "med_degree" = median(deg), "med_degree_n" = sum(deg == median(deg)),
+                    "med_degree" = median(deg), 
+                    "med_degree_n" = sum(deg == median(deg)),
                     "p95_degree" = quantile(deg, probs = 0.95), 
                     "p95_degree_n" = sum(deg == quantile(deg, probs = 0.95)),
                     "sd_degree" = sd(deg)))
@@ -410,15 +612,12 @@ desc_list <- lapply(c(g_list_lwise, "aggregate" = list(g_all)), function(x) {
 # Write to file
 do.call("rbind", desc_list) %>% 
   rownames_to_column(var = "layer") %>% 
-  write_xlsx("results/descriptives_network.xlsx")
+  write_xlsx("temp/descriptives_network.xlsx")
 ```
 
 
-# Correlations multi- and single-layer centralities
+# Explore multi- vs single-layer centralities
 
-## Compute centrality measures
-
-Functions for multi-layer centralities are based on muxViz but needed to be adapted in some parts to work on a network of this size (see aux_functions.R).
 
 ```{r}
 deg_single <- strength(g_all)
@@ -429,79 +628,101 @@ eig_mult <- GetMultiEigenvectorCentrality_edit(M, layers, obs)
 
 pr_single <- page_rank(g_all)$vector
 pr_mult <- GetMultiPageRankCentrality_edit(M, layers, obs)
+
+saveRDS(list(deg_single = deg_single, deg_mult = deg_mult,
+             eig_single = eig_single, eig_mult = eig_mult,
+             pr_single = pr_single, pr_mult = pr_mult),
+        "temp/centralities.RDS")
 ```
 
 ## Correlations
 
-> Results: Table 2 in manuscript
-
 ```{r}
-cor_within <- cor(data.frame(deg_mult, eig_mult, pr_mult, deg_single, eig_single, pr_single))
+cor_within <- cor(data.frame(deg_mult, eig_mult, 
+                             pr_mult, deg_single, 
+                             eig_single, pr_single))
 
-write_xlsx(as_tibble(cor_within, rownames = "measure"), "results/correlations_within.xlsx")
+cor_within_rho <- cor(data.frame(deg_mult, eig_mult, 
+                                 pr_mult, deg_single, 
+                                 eig_single, pr_single), method = "spearman")
+
+write_xlsx(as_tibble(cor_within, rownames = "measure"), 
+           "temp/correlations_within.xlsx")
+write_xlsx(as_tibble(cor_within_rho, rownames = "measure"), 
+           "temp/correlations_within_rho.xlsx")
 ```
 
 
 # Epidemic modeling
 
-Simulate epidemic k=500 times and save time to infection (tti) and duration of epidemic. Function model_sir_multiplex() is described in aux_functions.R.
+Simulate epidemic k times and save time to infection and duration of epidemic.
 
 Transmission rate tau:    
 
 - family = .15
 - school = .10
-- household = .20
+- household = .2
 - work = .05
 
 ```{r}
-sir_tti_duration <- lapply(1:500, function(x) {
+Sys.time()
+sir_tti_duration_epi <- lapply(1:100, function(x) {
   cat(x, " ")
   model_sir_multiplex(node_tensor,
                       tau = c(.15, .1, .2, .05), gamma = 5, step_size = 7,
                       seed_infs = 10, random_seed = x, t_max = 100,
-                      out = "tti_duration", verbose = FALSE)
+                      out = "tti_duration_epi", verbose = FALSE)
 })
+Sys.time()
+# ~6.5h
 
+# {plot(sir_tti_duration_epi[[1]][[3]], type = "l", 
+#       xlab = "Time", ylab = "Count",
+#       ylim = c(0, obs + 100)
+#       )
+# lines(sir_tti_duration_epi[[1]][[4]], type = "l", col = "red")
+# lines(sir_tti_duration_epi[[1]][[5]], type = "l", col = "blue")
+# legend(x = 2, y = 7e5,
+#        legend = c("Susceptible", "Infected", "Recovered"),
+#        lty = 1, bg = "transparent", bty = "n",
+#        col = c("black", "red", "blue"))
+# }
+
+saveRDS(sir_tti_duration_epi, "data_processed/sir_tti_duration_epi.RDS")
 saveRDS(sir_tti_duration, "data_processed/sir_tti_duration.RDS")
 
 # get only time to infection
-sir_tti <- lapply(sir_tti_duration, "[[", 1)
+sir_tti <- lapply(sir_tti_duration_epi, "[[", 1)
 
 # get only duration of epidemic
-sir_duration <- sapply(sir_tti_duration, "[[", 2)
+sir_duration <- sapply(sir_tti_duration_epi, "[[", 2)
+
+# get only curves
+sir_curves <- lapply(sir_tti_duration_epi, "[", 3:5)
 ```
 
 ## Descriptive statistics of epidemic
 
-> Results: Table 7 in manuscript (Appendix A)
-
 ```{r}
-# Get % of infected per simulation
+# Get share of infected per simulation
 pct_inf_sim <- sapply(sir_tti, function(x) sum(x < Inf)/length(x)*100)
-
-# Remove simulations where epidemic does not spread
-#...for tti
-sir_tti_sub <- sir_tti[pct_inf_sim > 25]
-#... and duration
-sir_duration_sub <- sir_duration[pct_inf_sim > 25]
+summary(pct_inf_sim)
 
 # Summary on simulation basis
 desc_epi <- data.frame(
-  "duration" = sir_duration_sub,
-  "infections" = sapply(sir_tti_sub, function(x) sum(x < Inf)/length(x)*100),
-  "tti_mean" = sapply(sir_tti_sub, function(x) mean(x[x < Inf]))
+  "duration" = sir_duration,
+  "infections" = sapply(sir_tti, function(x) sum(x < Inf)/length(x)*100),
+  "tti_mean" = sapply(sir_tti, function(x) mean(x[x < Inf])),
+  "inf_peak" = sapply(sir_curves, function(x) max(x[["I"]])/x[["S"]][[1]]*100),
+  "time_peak" = sapply(sir_curves, function(x) which.max(x[["I"]]))
 )
 
 # Summary on node basis
-inf_per_node <- do.call("cbind", sir_tti_sub) %>% 
+inf_per_node <- do.call("cbind", sir_tti) %>% 
   apply(., 1, function(x) sum(x < Inf)/length(x)*100)
 
 # % Nodes never infected
 never_infected <- sum(inf_per_node == 0)/length(inf_per_node)*100
-
-# Max. % infected in non-epidemics
-max_infected_nonepi <- 
-  max(sapply(sir_tti[pct_inf_sim < 25], function(x) length(x[x<Inf]))) / obs *100
 
 # Calculate summaries and collect in one table
 desc_epi_summary <- desc_epi %>% 
@@ -519,18 +740,68 @@ desc_epi_summary <- desc_epi %>%
          infpernode_sd = sd(inf_per_node)) %>% 
   pivot_longer(everything(), names_to = c("measure", "statistic"), 
                names_pattern = "(.+)_(.+$)") %>% 
-  add_row(measure = "never_infected", statistic = "total_pct", value = never_infected) %>% 
-  add_row(measure = "max_infected_nonepi", statistic = "total_pct", value = max_infected_nonepi)
+  add_row(measure = "never_infected", statistic = "total_pct", value = never_infected)
 
+write_xlsx(desc_epi_summary, "temp/descriptives_epidemic.xlsx")
 write_xlsx(desc_epi_summary, "results/descriptives_epidemic.xlsx")
 ```
 
-Prepare the outcome variable (tti) for prediction tasks. It's a list of length=no. epidemic simulations, each element is vector of tti's for all the nodes in the network.
+## Epi curves
+
+Prepare data
+
+```{r}
+# Get each simulation result into shape for plotting
+sir_curves_df <- lapply(sir_curves, function(x) {
+  df <- as.data.table(do.call("rbind", x))
+  steps <- ncol(df)
+  df %>% 
+    `colnames<-`(as.character(1:steps)) %>% 
+    rownames_to_column("status") %>% 
+    mutate(status = case_when(status == "1" ~ "S",
+                              status == "2" ~ "I",
+                              status == "3" ~ "R")) %>% 
+    pivot_longer(cols = -1, names_to = "step", values_to = "value") %>% 
+    mutate(step = as.integer(step))
+})
+
+# Add sim. number as variable to each df
+sir_curves_df <- lapply(1:length(sir_curves_df), function(x) {
+  mutate(sir_curves_df[[x]], sim_no = x)
+})
+
+# Bind all sims. into one data frame
+sir_curves_df <- as.data.table(do.call("rbind", sir_curves_df))
+```
+
+Make plot
+
+```{r, fig.width=7, fig.height=5}
+sir_curves_all %>% 
+  mutate(status = factor(status, levels = c("S", "I", "R")),
+         group = paste0(status, sim_no)) %>%
+  ggplot(aes(step, value)) +
+  geom_line(aes(color = status, group = group), 
+            alpha = .3, linewidth = 0.2) +
+  scale_color_viridis_d(option = "plasma", end = 0.95) +
+  scale_y_continuous(labels = label_number(scale = 1/1e6)) +
+  labs(x = "Week", y = "Count (million)", color = "Infection status") + 
+  guides(color = guide_legend(override.aes = list(linewidth = 3, 
+                                                  alpha = .7))) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+ggsave("temp/epi_curves.pdf", width = 7, height = 5)
+ggsave("temp/epi_curves.png", width = 7, height = 5, dpi = 1000)
+```
+
+Prepare the outcome variable from epidemic for prediction task: *time to infection*
 
 ```{r}
 # replace Inf with NA for easier handling
-tti <- lapply(sir_tti_sub, function(x) replace(x, x == Inf, NA))
+tti <- lapply(sir_tti, function(x) replace(x, x == Inf, NA))
 
+saveRDS(tti, "temp/tti.RDS")
 saveRDS(tti, "data_processed/tti.RDS")
 ```
 
@@ -539,9 +810,6 @@ saveRDS(tti, "data_processed/tti.RDS")
 
 ## Rank correlations
 
-Calculate Spearman's rho for each centrality and the time to infection. Do that for each simulated epidemic and then summarize over simulations.
-
-> Results: Table 3 in manuscript
 
 ```{r}
 # Multi-layer
@@ -554,21 +822,25 @@ correlations_multi <- lapply(1:length(tti), function(x) {
   list("degree" = degree, "eigenvector" = eigenvector, "pagerank" = pagerank)
 })
 
-saveRDS(correlations_multi, "results/correlations_multi.RDS")
+saveRDS(correlations_multi, "temp/correlations_multi.RDS")
+saveRDS(correlations_multi, "data_processed/correlations_multi.RDS")
 
 correlations_summary_multi <- 
   do.call("rbind", lapply(correlations_multi, function(x) do.call("cbind", x))) %>% 
   as.data.frame() %>% 
   `colnames<-` (c("degree", "eigenvector", "pagerank")) %>% 
+  #sapply(., hist, breaks = 50)
   mutate(sim = row_number()) %>% 
   pivot_longer(-4, names_to = "measure", values_to = "value") %>% 
   mutate(value_trans = fisher_z_transform(value)) %>% 
   group_by(measure) %>% 
   summarise(mean_trans = fisher_z_transform(mean(value_trans), back = TRUE),
             sd_trans = fisher_z_transform(sd(value_trans), back = TRUE),
-            cilow_trans = fisher_z_transform((mean(value_trans) - 1.96*(sd(value_trans)/sqrt(obs))), 
+            cilow_trans = fisher_z_transform((mean(value_trans) - 
+                                                1.96*(sd(value_trans)/sqrt(length(tti)))), 
                                              back = TRUE),
-            cihigh_trans = fisher_z_transform((mean(value_trans) + 1.96*(sd(value_trans)/sqrt(obs))), 
+            cihigh_trans = fisher_z_transform((mean(value_trans) + 
+                                                 1.96*(sd(value_trans)/sqrt(length(tti)))), 
                                               back = TRUE)
             ) %>% 
   mutate(layer = "multi")
@@ -584,259 +856,262 @@ correlations_single <- lapply(1:length(tti), function(x) {
   list("degree" = degree, "eigenvector" = eigenvector, "pagerank" = pagerank)
 })
 
-saveRDS(correlations_single, "results/correlations_single.RDS")
+saveRDS(correlations_single, "temp/correlations_single.RDS")
+saveRDS(correlations_single, "data_processed/correlations_single.RDS")
 
 correlations_summary_single <- 
   do.call("rbind", lapply(correlations_single, function(x) do.call("cbind", x))) %>% 
   as.data.frame() %>% 
   `colnames<-` (c("degree", "eigenvector", "pagerank")) %>% 
+  #sapply(., hist, breaks = 50)
   mutate(sim = row_number()) %>% 
   pivot_longer(-4, names_to = "measure", values_to = "value") %>% 
   mutate(value_trans = fisher_z_transform(value)) %>% 
   group_by(measure) %>% 
   summarise(mean_trans = fisher_z_transform(mean(value_trans), back = TRUE),
             sd_trans = fisher_z_transform(sd(value_trans), back = TRUE),
-            cilow_trans = fisher_z_transform((mean(value_trans) - 1.96*(sd(value_trans)/sqrt(obs))), 
+            cilow_trans = fisher_z_transform((mean(value_trans) -
+                                                1.96*(sd(value_trans)/sqrt(length(tti)))), 
                                              back = TRUE),
-            cihigh_trans = fisher_z_transform((mean(value_trans) + 1.96*(sd(value_trans)/sqrt(obs))), 
+            cihigh_trans = fisher_z_transform((mean(value_trans) + 
+                                                 1.96*(sd(value_trans)/sqrt(length(tti)))), 
                                               back = TRUE)
             ) %>% 
   mutate(layer = "single")
 
 # Combine single and multi and write into one table
 rbind(correlations_summary_single, correlations_summary_multi) %>% 
-  write_xlsx("results/correlations.xlsx")
+  write_xlsx("temp/correlations.xlsx")
 ```
 
 ## Regression task
 
-### Cox proportional hazard models
+### Distribution of IVs
 
-Create formulas for Cox models.
+Summary stats
 
 ```{r}
-formulas_cox_mult <- list(
-  # within centrality
-  Surv(time, status) ~ deg_mult, 
-  Surv(time, status) ~ deg_mult + I(deg_mult^2),
-  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
-  Surv(time, status) ~ eig_mult,
-  Surv(time, status) ~ eig_mult + I(eig_mult^2),
-  Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
-  Surv(time, status) ~ pr_mult,
-  Surv(time, status) ~ pr_mult + I(pr_mult^2),
-  Surv(time, status) ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  # across centralities, first order
-  Surv(time, status) ~ deg_mult + eig_mult,
-  Surv(time, status) ~ deg_mult + pr_mult,
-  Surv(time, status) ~ eig_mult + pr_mult,
-  Surv(time, status) ~ deg_mult + eig_mult + pr_mult,
-  # across centralities, second order
-  Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
-  Surv(time, status) ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
-  Surv(time, status) ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
-  Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
-  # across centralities, third order
-  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
-  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  # interactions second order
-  Surv(time, status) ~ deg_mult*eig_mult,
-  Surv(time, status) ~ deg_mult*pr_mult,
-  Surv(time, status) ~ eig_mult*pr_mult,
-  # interactions third order
-  Surv(time, status) ~ deg_mult*eig_mult*pr_mult)
+# Only for Eigen and Pagrank
+# (Degree is already included in network descriptives)
+data.frame("Eigenvector_Multi-layer" = eig_mult,
+           "Eigenvector_Single-layer" = eig_single,
+           "PageRank_Multi-layer" = pr_mult,
+           "PageRank_Single-layer" = pr_single) %>% 
+  pivot_longer(everything(), names_sep = "_", 
+               names_to = c("Measure", "Network type")) %>% 
+  mutate(`Network type` = str_replace_all(`Network type`, "\\.", "\\-")) %>%
+  group_by(`Network type`, Measure) %>% 
+  summarise(#min(value), 
+            #sum(value == min(value)),
+            quantile(value, 0.25),
+            sum(value == quantile(value, 0.25)),
+            mean(value), 
+            median(value), 
+            sum(value == median(value)),
+            quantile(value, 0.75),
+            sum(value == quantile(value, 0.75)),
+            sum(value == median(value)),
+            #max(value), 
+            #sum(value == max(value)),
+            sd(value)) %>% 
+  write_xlsx("temp/cent_stats.xlsx")
+```
 
-# Convert multi to single-layer formulas
-formulas_cox_single <- lapply(formulas_cox_mult, function(x) {
-  chars <- str_replace_all(as.character(x), "mult", "single") %>% 
-    paste(., collapse = " ")
-  form <- formula(str_replace_all(chars, "~ Surv\\(time, status\\)", "Surv\\(time, status\\) ~ ")) 
-  environment(form) <- .GlobalEnv
-  form
+Plots
+
+```{r, fig.width=8, fig.height=3.5}
+# data.frame("Degree" = deg_mult, "Eigenvector" = eig_mult, "PageRank" = pr_mult) %>% 
+#   pivot_longer(everything(), names_to = "measure", values_to = "value") %>% 
+#   ggplot(aes(value, fill = measure)) +
+#   geom_histogram(bins = 75) +
+#   facet_wrap(~ measure, scales = "free") +
+#   scale_fill_viridis_d(option = "plasma", end = 0.95) +
+#   scale_y_continuous(labels = label_number(scale = 1/1e6)) +
+#   labs(y = "Count (million)", x = NULL) +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+# 
+# ggsave("temp/cent_dist_multi.pdf", width = 8, height = 3.5)
+# ggsave("temp/cent_dist_multi.png", width = 8, height = 3.5, dpi = 1000)
+# 
+# data.frame("Degree" = deg_single, "Eigenvector" = eig_single, "PageRank" = pr_single) %>% 
+#   pivot_longer(everything(), names_to = "measure", values_to = "value") %>% 
+#   ggplot(aes(value, fill = measure)) +
+#   geom_histogram(bins = 75) +
+#   facet_wrap(~ measure, scales = "free") +
+#   scale_fill_viridis_d(option = "plasma", end = 0.95) +
+#   scale_y_continuous(labels = label_number(scale = 1/1e6)) +
+#   labs(y = "Count (million)", x = NULL) +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+# 
+# ggsave("temp/cent_dist_single.pdf", width = 8, height = 3.5)
+# ggsave("temp/cent_dist_single.png", width = 8, height = 3.5, dpi = 1000)
+
+data.frame("Degree_Multi-layer" = NA, 
+           "Degree_Single-layer" = deg_single, 
+           "Eigenvector_Multi-layer" = eig_mult,
+           "Eigenvector_Single-layer" = eig_single,
+           "PageRank_Multi-layer" = pr_mult,
+           "PageRank_Single-layer" = pr_single) %>% 
+  pivot_longer(everything(), names_sep = "_", 
+               names_to = c("Measure", "Network type")) %>%
+  mutate(`Network type` = str_replace_all(`Network type`, "\\.", "\\-")) %>% 
+  ggplot(aes(value, fill = `Network type`)) +
+  geom_density(adjust = 1, color = "transparent",
+               alpha = .6, position = "identity") +
+  facet_wrap(~ Measure, scales = "free") +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  labs(y = "Density", x = NULL) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+ggsave("temp/cent_dist_all.pdf", width = 8, height = 3.5)
+ggsave("temp/cent_dist_all.png", width = 8, height = 3.5, dpi = 1000)
+```
+
+Degree only 
+
+```{r, fig.width=5, fig.asp=1/1.6}
+data.frame(deg_single) %>% 
+ggplot(aes(deg_single, fill = "Degree")) +
+  geom_density(adjust = 1/4, color = "transparent",
+               alpha = .6, position = "identity") +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  labs(y = "Density", x = "Degree", fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("temp/cent_dist_deg.pdf", width = 5, height = 5/1.6)
+ggsave("temp/cent_dist_deg.png", width = 5, height = 5/1.6, dpi = 1000)
+```
+
+#### Eigenvector only, by decile
+
+```{r, fig.width=6, fig.asp=1/1.6}
+# Histograms per decile
+data.frame("Single-layer" = eig_single, "Multi-layer" = eig_mult) %>% 
+  pivot_longer(everything(), names_to = "measure", values_to = "value") %>% 
+  mutate(measure = str_replace_all(measure, "\\.", "\\-")) %>% 
+  mutate(decile = ntile(value, 10)) %>% 
+  ggplot(aes(value, fill = measure)) +
+  geom_density(adjust = 1/2, color = "transparent", stat = "density",
+               alpha = .6, position = "identity") +
+  facet_wrap(~ decile, scales = "free", nrow = 2) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  guides(fill = guide_legend(override.aes = list(linewidth = 3))) + 
+  labs(y = "Density", x = "Eigenvector centrality", fill = "Network type") +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        axis.text.x = element_text(angle = 45, size = 7, margin = margin(t = 12)),
+        panel.spacing.y = unit(-10, "pt"))
+
+ggsave("temp/cent_dist_eig_dec.pdf", width = 6, height = 6/1.6)
+ggsave("temp/cent_dist_eig_dec.png", width = 6, height = 6/1.6, dpi = 1000)
+```
+
+#### Pagerank only, by decile
+
+```{r, fig.width=6, fig.asp=1/1.6}
+data.frame("Single-layer" = pr_single, "Multi-layer" = pr_mult) %>% 
+  pivot_longer(everything(), names_to = "measure", values_to = "value") %>% 
+  mutate(measure = str_replace_all(measure, "\\.", "\\-")) %>% 
+  mutate(decile = ntile(value, 10)) %>% 
+  ggplot(aes(value, fill = measure)) +
+  geom_density(adjust = 1/2, color = "transparent",
+               alpha = .6, position = "identity") +
+  facet_wrap(~ decile, scales = "free", nrow = 2) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  guides(fill = guide_legend(override.aes = list(linewidth = 3))) + 
+  labs(y = "Density", x = "PageRank centrality", fill = "Network type") +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        axis.text.x = element_text(angle = 45, size = 7, margin = margin(t = 8)),
+        panel.spacing.y = unit(-10, "pt"))
+
+ggsave("temp/cent_dist_pr_dec.pdf", width = 6, height = 6/1.6)
+ggsave("temp/cent_dist_pr_dec.png", width = 6, height = 6/1.6, dpi = 1000)
+```
+
+### Distribution of DV
+
+```{r, fig.width=7, fig.asp=1/1.6}
+tti_df <- 
+  do.call("cbind", tti) %>% 
+  as.data.table() %>%
+  rownames_to_column(var = "id") %>% 
+  pivot_longer(-id, names_to = "sim_no", names_prefix = "V", 
+               values_to = "tti")
+  
+ggplot(tti_df, aes(tti, group = sim_no)) +
+  geom_density(adjust = 5, alpha = .1, linewidth = 0.2) + 
+  labs(x = "Weeks until infection", y = "Density") +
+  theme_minimal()
+
+ggsave("temp/tti_dist.pdf", width = 7, height = 7/1.6)
+ggsave("temp/tti_dist.png", width = 7, height = 7/1.6)
+```
+
+### Bivariate plots
+
+Multi-layer
+
+```{r}
+lapply(list(deg_mult, eig_mult, pr_mult), function(x) {
+  # (one tti dataset will do)
+  plot(x, tti[[3]])
 })
 ```
 
-Run multi-layer models.
-
-> Results: Tables 4 and 8 in manuscript
+Single-layer
 
 ```{r}
-# Function to prepare data and run models
-surv_models <- lapply(tti, function(x) {
-  # restructure data
-  df <- data.table(x) %>% 
-  mutate(time = x,
-         status = ifelse(is.na(.data$time), 0, 1)) %>%
-  mutate(time = ifelse(is.na(.data$time),
-                       max(.data$time, na.rm = TRUE), 
-                       .data$time),
-         # add predictors
-         deg_mult = deg_mult[,1],
-         eig_mult = eig_mult[,1],
-         pr_mult = pr_mult[,1]) %>% 
-  as.data.table()
-  
-  lapply(formulas_cox_mult, function(y) {
-    # run models and compute Uno's weighted concordance index
-    # do so safely and catch errors in case of non-convergence
-    fit <- tryCatch(coxph(formula = y, data = df),
-                    error = function(e) {
-                      paste(e$message, y)
-                      FALSE},
-                    warning = function(w) {
-                      paste(w$message, y)
-                      FALSE
-                      })
-    
-    if (isFALSE(fit)) {
-      return("ci" = NA)
-    } else {
-      ci <- concordance(fit, timewt = "n/G2")
-      return(c("ci" = ci))
-    }
-
-  })
-}
-)
-
-saveRDS(surv_models, "results/surv_models.RDS")
-
-
-# Get C from models, summarize over data sets 
-surv_models_ci <- 
-  lapply(surv_models, function(x) sapply(x, function(y) y[[1]])) %>%
-  do.call("rbind", .) %>%
-  as.data.frame() %>% 
-  rename_with(~ str_remove(.x, "V")) %>% 
-  mutate(sim = row_number()) %>% 
-  pivot_longer(-26, names_to = "model", values_to = "value", 
-               names_transform = function(x) as.factor(as.integer(x))) %>% 
-  mutate(value_trans = fisher_z_transform(value)) %>% 
-  group_by(model) %>% 
-  summarise(convergence = sum(!is.na(value))/length(surv_models)*100,
-            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
-            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
-            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
-                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
-                                             back = TRUE),
-            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
-                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
-                                              back = TRUE)
-            )
-
-write_xlsx(surv_models_ci, "results/surv_models_multi.xlsx")
+lapply(list(deg_single, eig_single, pr_single), function(x) {
+  # (one tti dataset will do)
+  plot(x, tti[[3]])
+})
 ```
 
-Run single-layer models.
-
-> Results: Tables 4 and 8 in manuscript
-
-```{r}
-# Function to prepare data and run models
-surv_models_single <- lapply(tti, function(x) {
-  # restructure data
-  df <- data.table(x) %>% 
-  mutate(time = x,
-         status = ifelse(is.na(.data$time), 0, 1)) %>%
-  mutate(time = ifelse(is.na(.data$time),
-                       max(.data$time, na.rm = TRUE), 
-                       .data$time),
-         # add predictors
-         deg_single = deg_single,
-         eig_single = eig_single,
-         pr_single = pr_single) %>% 
-  as.data.table()
-  
-  lapply(formulas_cox_single, function(y) {
-    # run models and compute Uno's weighted concordance index
-    # do so safely and catch errors in case of non-convergence
-    fit <- tryCatch(coxph(formula = y, data = df),
-                    error = function(e) {
-                      paste(e$message, y)
-                      FALSE},
-                    warning = function(w) {
-                      paste(w$message, y)
-                      FALSE
-                      })
-    
-    if (isFALSE(fit)) {
-      return("ci" = NA)
-    } else {
-      ci <- concordance(fit, timewt = "n/G2")
-      return(c("ci" = ci))
-    }
-  })
-}
-)
-
-saveRDS(surv_models_single, "results/surv_models_single.RDS")
-
-
-# Get C from models, summarize over data sets 
-surv_models_ci_single <- 
-  lapply(surv_models_single, function(x) sapply(x, function(y) y[[1]])) %>%
-  do.call("rbind", .) %>%
-  as.data.frame() %>% 
-  rename_with(~ str_remove(.x, "V")) %>% 
-  mutate(sim = row_number()) %>% 
-  pivot_longer(-26, names_to = "model", values_to = "value", 
-               names_transform = function(x) as.factor(as.integer(x))) %>% 
-  mutate(value_trans = fisher_z_transform(value)) %>% 
-  group_by(model) %>% 
-  summarise(convergence = sum(!is.na(value))/length(surv_models)*100,
-            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
-            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
-            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
-                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
-                                             back = TRUE),
-            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
-                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
-                                              back = TRUE)
-            )
-
-write_xlsx(surv_models_ci_single, "results/surv_models_single.xlsx")
-```
 
 ### Linear models
 
-Create formulas for linear regression models.
+Create formulas
 
 ```{r}
 
-formulas_mult <- list(
-  # within centrality
-  x ~ deg_mult, 
-  x ~ deg_mult + I(deg_mult^2),
-  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
-  x ~ eig_mult,
-  x ~ eig_mult + I(eig_mult^2),
-  x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
-  x ~ pr_mult,
-  x ~ pr_mult + I(pr_mult^2),
-  x ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  # across centralities, first order
-  x ~ deg_mult + eig_mult,
-  x ~ deg_mult + pr_mult,
-  x ~ eig_mult + pr_mult,
-  x ~ deg_mult + eig_mult + pr_mult,
-  # across centralities, second order
-  x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
-  x ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
-  x ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
-  x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
-  # across centralities, third order
-  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
-  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
-  # interactions second order
-  x ~ deg_mult*eig_mult,
-  x ~ deg_mult*pr_mult,
-  x ~ eig_mult*pr_mult,
-  # interactions third order
-  x ~ deg_mult*eig_mult*pr_mult)
+formulas_mult <- list(# within centrality
+                 x ~ deg_mult, 
+                 x ~ deg_mult + I(deg_mult^2),
+                 x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
+                 x ~ eig_mult,
+                 x ~ eig_mult + I(eig_mult^2),
+                 x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+                 x ~ pr_mult,
+                 x ~ pr_mult + I(pr_mult^2),
+                 x ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                 # across centralities, first order
+                 x ~ deg_mult + eig_mult,
+                 x ~ deg_mult + pr_mult,
+                 x ~ eig_mult + pr_mult,
+                 x ~ deg_mult + eig_mult + pr_mult,
+                 # across centralities, second order
+                 x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
+                 x ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
+                 x ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+                 x ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+                 # across centralities, third order
+                x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+                x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                x ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                # interactions second order
+                x ~ deg_mult*eig_mult,
+                x ~ deg_mult*pr_mult,
+                x ~ eig_mult*pr_mult,
+                # interactions third order
+                x ~ deg_mult*eig_mult*pr_mult)#,
+                # # within and across variable interactions
+                # x ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + deg_mult*eig_mult*pr_mult)
 
 # Convert multi to single-layer formulas
 formulas_single <- lapply(formulas_mult, function(x) {
@@ -848,12 +1123,10 @@ formulas_single <- lapply(formulas_mult, function(x) {
 })
 ```
 
-Run multi-layer models.
-
-> Results: Tables 5 and 9 in manuscript
+Run models
 
 ```{r}
-# Run linear models and return estimates of interest
+Sys.time()
 lin_models <- lapply(tti, function(t) lapply(formulas_mult, function(u) {
   x <<- t
   r2 <- summary(lm(u))$adj.r.squared
@@ -862,10 +1135,13 @@ lin_models <- lapply(tti, function(t) lapply(formulas_mult, function(u) {
   list("r2" = r2, "rmse" = rmse)
   })
 )
+Sys.time()
+# ~takes 1hr
 
-saveRDS(lin_models, "results/lin_models_multi.RDS")
+saveRDS(lin_models, "temp/lin_models_multi.RDS")
+saveRDS(lin_models, "data_processed/lin_models_multi.RDS")
 
-# Save estimates per simulation sub-objects (r2, rmse)
+# save estimates per simulation sub-objects
 lin_models_r2 <- 
   lapply(lin_models, function(x) sapply(x, function(y) y[["r2"]])) %>% 
   do.call("rbind", .) %>% 
@@ -882,17 +1158,19 @@ lin_models_rmse <-
   pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
                names_transform = function(x) as.factor(as.integer(x)))
 
-# Combine r2 and rmse
 lin_models_measures <- lin_models_r2 %>% 
   full_join(lin_models_rmse, by = c("sim_no", "model"))
 
-# Summarize estimates over simulations
 lin_models_summary <- lin_models_measures %>% 
   mutate(r2_trans = fisher_z_transform(r2)) %>% 
   group_by(model) %>% 
   mutate(across(rmse, list(
     mean = ~mean(.x),
-    sd = ~sd(.x))),
+    min = ~min(.x),
+    pct25 = ~quantile(.x, probs = .25),
+    pct75 = ~quantile(.x, probs = .75),
+    max = ~max(.x),
+    sd = ~sd(.x))), 
     rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
     rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
   mutate(across(r2_trans, list(
@@ -906,15 +1184,14 @@ lin_models_summary <- lin_models_measures %>%
   select(-sim_no, -r2, -rmse, -r2_trans) %>% 
   distinct()
 
+write_xlsx(lin_models_summary, "temp/lin_models_multi.xlsx")
 write_xlsx(lin_models_summary, "results/lin_models_multi.xlsx")
 ```
 
-Run single-layer models.
-
-> Results: Tables 5 and 9 in manuscript
+With single-layer centralities
 
 ```{r}
-# Run linear models and return estimates of interest
+Sys.time()
 lin_models_single <- lapply(tti, function(t) lapply(formulas_single, function(u) {
   x <<- t
   r2 <- summary(lm(u))$adj.r.squared
@@ -923,10 +1200,12 @@ lin_models_single <- lapply(tti, function(t) lapply(formulas_single, function(u)
   list("r2" = r2, "rmse" = rmse)
   })
 )
+Sys.time()
 
-saveRDS(lin_models_single, "results/lin_models_single.RDS")
+saveRDS(lin_models_single, "temp/lin_models_single.RDS")
+saveRDS(lin_models_single, "data_processed/lin_models_single.RDS")
 
-# Save estimates per simulation sub-objects (r2, rmse)
+# save estimates per simulation sub-objects
 lin_models_r2_single <- 
   lapply(lin_models_single, function(x) sapply(x, function(y) y[["r2"]])) %>% 
   do.call("rbind", .) %>% 
@@ -943,16 +1222,18 @@ lin_models_rmse_single <-
   pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
                names_transform = function(x) as.factor(as.integer(x)))
 
-# Combine r2 and rmse
 lin_models_measures_single <- lin_models_r2_single %>% 
   full_join(lin_models_rmse_single, by = c("sim_no", "model"))
 
-# Summarize estimates over simulations
 lin_models_summary_single <- lin_models_measures_single %>% 
   mutate(r2_trans = fisher_z_transform(r2)) %>% 
   group_by(model) %>% 
   mutate(across(rmse, list(
     mean = ~mean(.x),
+    min = ~min(.x),
+    pct25 = ~quantile(.x, probs = .25),
+    pct75 = ~quantile(.x, probs = .75),
+    max = ~max(.x),
     sd = ~sd(.x))),
     rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
     rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
@@ -967,104 +1248,68 @@ lin_models_summary_single <- lin_models_measures_single %>%
   select(-sim_no, -r2, -rmse, -r2_trans) %>% 
   distinct()
 
+
+write_xlsx(lin_models_summary_single, "temp/lin_models_single.xlsx")
 write_xlsx(lin_models_summary_single, "results/lin_models_single.xlsx")
 ```
 
-## Tau-weighted multi-layer degree
 
-Calculate new centrality measure based on transmission rate values (tau) for each layer as used in epidemic simulation. See aux_functions.R for definition of GetMultiTauDegree().
+### Cox proportional hazard models
+
+Formulas
 
 ```{r}
-# Get and normalize taus used in simulation
-taus <- c(.15, .1, .2, .05)
-taus_norm <- taus/sum(taus)
+formulas_cox_mult <- list(# within centrality
+                 Surv(time, status) ~ deg_mult, 
+                 Surv(time, status) ~ deg_mult + I(deg_mult^2),
+                 Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3),
+                 Surv(time, status) ~ eig_mult,
+                 Surv(time, status) ~ eig_mult + I(eig_mult^2),
+                 Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+                 Surv(time, status) ~ pr_mult,
+                 Surv(time, status) ~ pr_mult + I(pr_mult^2),
+                 Surv(time, status) ~ pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                 # across centralities, first order
+                 Surv(time, status) ~ deg_mult + eig_mult,
+                 Surv(time, status) ~ deg_mult + pr_mult,
+                 Surv(time, status) ~ eig_mult + pr_mult,
+                 Surv(time, status) ~ deg_mult + eig_mult + pr_mult,
+                 # across centralities, second order
+                 Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2),
+                 Surv(time, status) ~ deg_mult + I(deg_mult^2) + pr_mult + I(pr_mult^2),
+                 Surv(time, status) ~ eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+                 Surv(time, status) ~ deg_mult + I(deg_mult^2) + eig_mult + I(eig_mult^2) + pr_mult + I(pr_mult^2),
+                 # across centralities, third order
+                Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3),
+                Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                Surv(time, status) ~ eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + eig_mult + I(eig_mult^2)+ I(eig_mult^3) + pr_mult + I(pr_mult^2)+ I(pr_mult^3),
+                # interactions second order
+                Surv(time, status) ~ deg_mult*eig_mult,
+                Surv(time, status) ~ deg_mult*pr_mult,
+                Surv(time, status) ~ eig_mult*pr_mult,
+                # interactions third order
+                Surv(time, status) ~ deg_mult*eig_mult*pr_mult)#,
+                # # within and across variable interactions
+                # Surv(time, status) ~ deg_mult + I(deg_mult^2)+ I(deg_mult^3) + deg_mult*eig_mult*pr_mult)
 
-# Calculate cenrtality
-deg_multtau <- GetMultiTauDegree(M, layers, obs, taus_norm)
+# Convert multi to single-layer formulas
+formulas_cox_single <- lapply(formulas_cox_mult, function(x) {
+  chars <- str_replace_all(as.character(x), "mult", "single") %>% 
+    paste(., collapse = " ")
+  form <- formula(str_replace_all(chars, "~ Surv\\(time, status\\)", "Surv\\(time, status\\) ~ ")) 
+  environment(form) <- .GlobalEnv
+  form
+})
 ```
 
-Set up formulas for regression models.
+Run models
 
 ```{r}
-# Linear regressions
-formulas_taudegree <- list(
-  x ~ deg_multtau, 
-  x ~ deg_multtau + I(deg_multtau^2),
-  x ~ deg_multtau + I(deg_multtau^2)+ I(deg_multtau^3)
-  )
+# MULTI-layer models
 
-# Cox regressions
-formulas_taudegree_cox <- list(
-  Surv(time, status) ~ deg_multtau, 
-  Surv(time, status) ~ deg_multtau + I(deg_multtau^2),
-  Surv(time, status) ~ deg_multtau + I(deg_multtau^2)+ I(deg_multtau^3)
-  )
-```
-
-### Simulated data
-
-First, run regression models with new centrality measures on simulated epidemics.
-
-#### Linear models
-
-```{r}
-lin_models_taudegree <- lapply(tti, function(t) lapply(formulas_taudegree, function(u) {
-  x <<- t
-  fit <- lm(u)
-  r2 <- summary(fit)$adj.r.squared
-  rmse <- sqrt(mean(fit$residuals^2))
-  
-  list("r2" = r2, "rmse" = rmse)
-  })
-)
-
-saveRDS(lin_models_taudegree, "results/lin_models_taudegree.RDS")
-
-lin_models_r2_taudegree <- 
-  lapply(lin_models_taudegree, function(x) sapply(x, function(y) y[["r2"]])) %>% 
-  do.call("rbind", .) %>% 
-  as.data.frame() %>% 
-  mutate(sim_no = row_number()) %>% 
-  pivot_longer(-sim_no, names_to = "model", values_to = "r2", names_prefix = "V",
-               names_transform = function(x) as.factor(as.integer(x)))
-
-lin_models_rmse_taudegree <- 
-  lapply(lin_models_taudegree, function(x) sapply(x, function(y) y[["rmse"]])) %>% 
-  do.call("rbind", .) %>% 
-  as.data.frame() %>% 
-  mutate(sim_no = row_number()) %>% 
-  pivot_longer(-sim_no, names_to = "model", values_to = "rmse", names_prefix = "V", 
-               names_transform = function(x) as.factor(as.integer(x)))
-
-lin_models_measures_taudegree <- lin_models_r2_taudegree %>% 
-  full_join(lin_models_rmse_taudegree, by = c("sim_no", "model"))
-
-lin_models_summary_taudegree <- lin_models_measures_taudegree %>% 
-  mutate(r2_trans = fisher_z_transform(r2)) %>% 
-  group_by(model) %>% 
-  mutate(across(rmse, list(
-    mean = ~mean(.x),
-    sd = ~sd(.x))),
-    rmse_cilow = rmse_mean - 1.96*(rmse_sd/sqrt(length(tti))),
-    rmse_cihigh = rmse_mean + 1.96*(rmse_sd/sqrt(length(tti)))) %>% 
-  mutate(across(r2_trans, list(
-    mean = ~fisher_z_transform(mean(.x), back = TRUE),
-    sd = ~fisher_z_transform(sd(.x), back = TRUE),
-    cilow = ~fisher_z_transform((mean(.x) - 1.96*(sd(.x)/sqrt(length(tti)))), 
-                                     back = TRUE),
-    cihigh = ~fisher_z_transform((mean(.x) + 1.96*(sd(.x)/sqrt(length(tti)))), 
-                                       back = TRUE)
-  ))) %>% 
-  select(-sim_no, -r2, -rmse, -r2_trans) %>% 
-  distinct()
-
-write_xlsx(lin_models_summary_taudegree, "results/lin_models_taudegree.xlsx")
-```
-
-#### Cox models
-
-```{r}
-surv_models_taudegree <- lapply(tti, function(x) {
+# Function to prepare data and run models
+surv_models_multi <- lapply(tti, function(x) {
   # restructure data
   df <- data.table(x) %>% 
   mutate(time = x,
@@ -1072,10 +1317,12 @@ surv_models_taudegree <- lapply(tti, function(x) {
   mutate(time = ifelse(is.na(.data$time),
                        max(.data$time, na.rm = TRUE), 
                        .data$time),
-         deg_multtau = deg_multtau) %>% 
+         deg_mult = deg_mult[,1],
+         eig_mult = eig_mult[,1],
+         pr_mult = pr_mult[,1]) %>% 
   as.data.table()
   
-  lapply(formulas_taudegree_cox, function(y) {
+  lapply(formulas_cox_mult, function(y) {
     # run models and compute Uno's weighted concordance index
     fit <- tryCatch(coxph(formula = y, data = df),
                     error = function(e) {
@@ -1096,10 +1343,15 @@ surv_models_taudegree <- lapply(tti, function(x) {
   })
 }
 )
+# ~7.5h
+
+saveRDS(surv_models_multi, "temp/surv_models_multi.RDS")
+saveRDS(surv_models_multi, "data_processed/surv_models_multi.RDS")
+
 
 # Get C from models, summarize over data sets 
-surv_models_ci_taudegree <- 
-  lapply(surv_models_taudegree, function(x) sapply(x, function(y) y[[1]])) %>%
+surv_models_ci_multi <- 
+  lapply(surv_models_multi, function(x) sapply(x, function(y) y[[1]])) %>%
   do.call("rbind", .) %>%
   as.data.frame() %>% 
   rename_with(~ str_remove(.x, "V")) %>% 
@@ -1108,7 +1360,15 @@ surv_models_ci_taudegree <-
                names_transform = function(x) as.factor(as.integer(x))) %>% 
   mutate(value_trans = fisher_z_transform(value)) %>% 
   group_by(model) %>% 
-  summarise(convergence = sum(!is.na(value))/length(surv_models_taudegree)*100,
+  summarise(convergence = sum(!is.na(value))/length(surv_models_multi)*100,
+            mean = mean(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            pct25 = quantile(value, probs = .25, na.rm = TRUE),
+            pct75 = quantile(value, probs = .75, na.rm = TRUE),
+            max = max(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            cilow = mean - 1.96*(sd/sqrt(length(tti))),
+            cihigh = mean + 1.96*(sd/sqrt(length(tti))),
             mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
             sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
             cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
@@ -1119,60 +1379,1015 @@ surv_models_ci_taudegree <-
                                               back = TRUE)
             )
 
-write_xlsx(surv_models_ci_taudegree, "results/surv_models_taudegree.xlsx")
+write_xlsx(surv_models_ci_multi, "temp/surv_models_multi.xlsx")
+write_xlsx(surv_models_ci_multi, "results/surv_models_multi.xlsx")
 ```
 
 
-### Test data
+```{r}
+# SINGLE-layer models
 
-Get and clean Covid-test data.
+# Function to prepare data and run models
+surv_models_single <- lapply(tti, function(x) {
+  # restructure data
+  df <- data.table(x) %>% 
+  mutate(time = x,
+         status = ifelse(is.na(.data$time), 0, 1)) %>%
+  mutate(time = ifelse(is.na(.data$time),
+                       max(.data$time, na.rm = TRUE), 
+                       .data$time),
+         deg_single = deg_single,
+         eig_single = eig_single,
+         pr_single = pr_single) %>% 
+  as.data.table()
+  
+  lapply(formulas_cox_single, function(y) {
+    # run models and compute Uno's weighted concordance index
+    fit <- tryCatch(coxph(formula = y, data = df),
+                    error = function(e) {
+                      paste(e$message, y)
+                      FALSE},
+                    warning = function(w) {
+                      paste(w$message, y)
+                      FALSE
+                      })
+    
+    if (isFALSE(fit)) {
+      return("ci" = NA)
+    } else {
+      ci <- concordance(fit, timewt = "n/G2")
+      return(c("ci" = ci))
+    }
+  })
+}
+)
+
+saveRDS(surv_models_single, "temp/surv_models_single.RDS")
+saveRDS(surv_models_single, "data_processed/surv_models_single.RDS")
+
+
+# Get C from models, summarize over data sets 
+surv_models_ci_single <- 
+  lapply(surv_models_single, function(x) sapply(x, function(y) y[[1]])) %>%
+  do.call("rbind", .) %>%
+  as.data.frame() %>% 
+  rename_with(~ str_remove(.x, "V")) %>% 
+  mutate(sim = row_number()) %>% 
+  pivot_longer(-26, names_to = "model", values_to = "value", 
+               names_transform = function(x) as.factor(as.integer(x))) %>% 
+  mutate(value_trans = fisher_z_transform(value)) %>% 
+  group_by(model) %>% 
+  summarise(convergence = sum(!is.na(value))/length(surv_models_single)*100,
+            mean = mean(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            pct25 = quantile(value, probs = .25, na.rm = TRUE),
+            pct75 = quantile(value, probs = .75, na.rm = TRUE),
+            max = max(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            cilow = mean - 1.96*(sd/sqrt(length(tti))),
+            cihigh = mean + 1.96*(sd/sqrt(length(tti))),
+            mean_trans = fisher_z_transform(mean(value_trans, na.rm = TRUE), back = TRUE),
+            sd_trans = fisher_z_transform(sd(value_trans, na.rm = TRUE), back = TRUE),
+            cilow_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                              - 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                             back = TRUE),
+            cihigh_trans = fisher_z_transform((mean(value_trans, na.rm = TRUE) 
+                                               + 1.96*(sd(value_trans, na.rm = TRUE)/sqrt(length(tti)))), 
+                                              back = TRUE)
+            )
+
+write_xlsx(surv_models_ci_single, "temp/surv_models_single.xlsx")
+write_xlsx(surv_models_ci_single, "results/surv_models_single.xlsx")
+```
+
+### XGBoost
+
+#### Get hyperparameters from one data set
+
+Data prep
 
 ```{r}
-# Read in data on individual Covid tests
+# make one dataframe
+set.seed(9106)
+xgb_dat <- 
+  data.table("degree" = deg_mult[,1], 
+             "eigen" = eig_mult[,1], 
+             "pagerank" = pr_mult[,1], 
+             "tti" = tti[[1]]) %>% 
+   drop_na()
+  
+# split 10/90 train/test
+set.seed(9106)
+xgb_split <- initial_split(xgb_dat, prop = 0.1)
+xgb_train <- training(xgb_split)
+xgb_test <- testing(xgb_split)
+```
+
+Hyperparameter specs
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = 3,
+  learn_rate = tune()
+  ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_spec
+```
+
+Tuning grid (space-filling search design)
+
+```{r}
+set.seed(9106)
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(2,5)),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(range = c(0.2, 0.9)),
+  learn_rate(),
+  size = 50
+)
+
+xgb_grid
+```
+
+Workflow
+
+```{r}
+xgb_wf <- workflow() %>% 
+  add_formula(tti ~ .) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+Create 10 CV samples
+
+```{r}
+set.seed(9106)
+xgb_folds <- vfold_cv(xgb_train, v = 10)
+
+xgb_folds
+```
+
+Do the tuning
+
+```{r}
+n_1cores <- parallel::detectCores() - 1
+all_cores <- n_1cores + 1
+
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+Sys.time()
+set.seed(9106)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = xgb_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+Sys.time()
+# ~ 53min, 4 cores, 10% of one data set
+
+stopCluster(cl)
+
+xgb_res
+```
+
+Explore results
+
+```{r}
+collect_metrics(xgb_res) %>% 
+  filter(.metric == "rsq") %>% 
+  arrange(desc(mean))
+
+collect_metrics(xgb_res) %>% 
+  filter(.metric == "rmse") %>% 
+  arrange(mean)
+
+# relationship of r2 and rmse
+collect_metrics(xgb_res) %>%
+  pivot_wider(id_cols = trees:sample_size, 
+              names_from = .metric, 
+              values_from = mean) %>% 
+  ggplot(aes(rsq, rmse)) +
+  geom_point() 
+```
+
+```{r}
+collect_metrics(xgb_res) %>% 
+  filter(.metric == "rmse") %>% 
+  select(mean, trees:sample_size) %>% 
+  pivot_longer(trees:sample_size,
+               values_to = "value",
+               names_to = "parameter") %>% 
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = .8, show.legend = FALSE) +
+  facet_wrap(~ parameter, scales = "free_x") +
+  labs(x = NULL, y = "RMSE")
+
+collect_metrics(xgb_res) %>% 
+  filter(.metric == "rsq") %>% 
+  select(mean, trees:sample_size) %>% 
+  pivot_longer(trees:sample_size,
+               values_to = "value",
+               names_to = "parameter") %>% 
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = .8, show.legend = FALSE) +
+  facet_wrap(~ parameter, scales = "free_x") +
+  labs(x = NULL, y = "R2")
+```
+
+Select best parameter configuration
+
+```{r}
+show_best(xgb_res, "rsq")
+show_best(xgb_res, "rmse")
+select_by_one_std_err(xgb_res, metric = "rmse", desc(min_n))
+select_by_one_std_err(xgb_res, metric = "rmse", desc(tree_depth))
+select_by_one_std_err(xgb_res, metric = "rmse", desc(learn_rate))
+select_by_one_std_err(xgb_res, metric = "rmse", desc(loss_reduction))
+select_by_one_std_err(xgb_res, metric = "rmse", desc(sample_size))
+
+# Manual selection based on plot and considering possible overfitting
+best_rmse <- tibble(trees = 500, min_n = 20, tree_depth = 4, 
+                    learn_rate = 0.1, loss_reduction = 0, sample_size = 0.5)
+```
+
+Best model: variable importance (training)
+
+```{r}
+xgb_final <- finalize_workflow(xgb_wf, best_rmse)
+
+xgb_final %>% 
+  fit(data = xgb_train) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = "point")
+# ~1min
+```
+
+Best model: fit on training data only
+
+```{r}
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+set.seed(9106)
+xgb_res_train <- xgb_final %>% 
+  fit_resamples(xgb_folds)
+
+stopCluster(cl)
+
+env <- foreach:::.foreachGlobals
+rm(list = ls(name = env), pos = env)
+
+collect_metrics(xgb_res_train)
+```
+
+Fit on training and test data (last_fit() does both)
+
+```{r}
+xgb_res_final <- last_fit(xgb_final, xgb_split)
+# ~1min
+
+xgb_res_final_metrics <- collect_metrics(xgb_res_final)
+
+xgb_res_final_metrics
+```
+
+Variable importance (test)
+
+```{r}
+vi_final <- xgb_res_final %>% 
+  extract_workflow() %>% 
+  extract_fit_engine() %>% 
+  xgb.importance(model = .)
+
+vi_final
+```
+
+Some plots 
+
+```{r}
+# Combined tree
+xgb_res_final %>% 
+  extract_workflow() %>% 
+  extract_fit_engine() %>% 
+  xgb.plot.multi.trees()
+
+# One tree
+xgb_res_final %>% 
+  extract_workflow() %>% 
+  extract_fit_engine() %>% 
+  xgb.plot.tree(model = ., trees = 0)
+
+# Observed vs. predicted
+xgb_res_final[[".predictions"]][[1]] %>% 
+  slice_sample(prop = 0.1) %>% 
+  ggplot(aes(tti, .pred)) +
+  geom_jitter(width = .2, alpha = .3) +
+  geom_smooth(method = lm, se = FALSE)
+```
+
+#### For all datasets
+
+Fit models on remaining 99 datasets (again with 10/90 train/test split), using hyperparameters found for first dataset.
+
+```{r}
+# Multi-layer
+xgb_res_mult <- lapply(1:length(tti), function(x) {
+  print(paste0(x, ":", Sys.time(), " "))
+  
+  # assign results from first dataset used for tuning to first list object
+  if(x == 1) {
+
+    list("model_params" = best_rmse,
+         "metrics" = xgb_res_final_metrics,
+         "vimportance" = vi_final,
+         "last_fit" = xgb_res_final[,c(".metrics", ".workflow")])
+
+  # do model fitting for other datasets
+  } else {
+
+    xgb_pipeline(seed = x,
+                 predictors = list("degree" = deg_mult[,1], 
+                                   "eigen" = eig_mult[,1],
+                                   "pagerank" = pr_mult[,1]),
+                 outcome = list("tti" = tti[[x]]),  
+                 eval_metric = "rmse", 
+                 objective = "reg:squarederror",
+                 hyperparams = best_rmse, 
+                 train_prop = 0.1)
+  }
+})
+
+saveRDS(xgb_res_mult, "results/xgb_res_mult.RDS")
+
+lapply(xgb_res_mult, "[[", "last_fit") %>% 
+  saveRDS(., "results/xgb_fits_mult.RDS")
+
+
+# Single-layer
+xgb_res_single <- lapply(1:length(tti), function(x) {
+  print(paste0(x, ":", Sys.time(), " "))
+  
+  xgb_pipeline(seed = x,
+               predictors = list("degree" = deg_single, 
+                                 "eigen" = eig_single,
+                                 "pagerank" = pr_single),
+               outcome = list("tti" = tti[[x]]),  
+               eval_metric = "rmse", 
+               objective = "reg:squarederror",
+               hyperparams = best_rmse, 
+               train_prop = 0.1)
+})
+
+
+saveRDS(xgb_res_single, "results/xgb_res_single.RDS")
+
+lapply(xgb_res_single, "[[", "last_fit") %>% 
+  saveRDS(., "results/xgb_fits_single.RDS")
+```
+
+#### Performance on out of sample data
+
+Multi
+
+```{r, fig.width = 6, fig.asp=1/1.6}
+# average performance metrics over datasets
+xgb_res_mult_metrics <- 
+  lapply(1:length(xgb_res_mult), function(x) {
+    xgb_res_mult[[x]][["metrics"]] %>% 
+      select(.metric, .estimate) %>% 
+      mutate(sim_no = x)
+    }) %>% 
+  do.call("rbind", .) %>% 
+  as.data.table()
+
+saveRDS(xgb_res_mult_metrics, "results/xgb_metrics_mult.RDS")
+```
+
+Plot
+
+```{r, fig.width = 6, fig.asp=1/1.6}
+xgb_res_mult_metrics %>% 
+  mutate(.metric = ifelse(.metric == "rmse", "RMSE", "R2")) %>% 
+  ggplot(aes(.estimate, fill = .metric)) +
+  geom_histogram(bins = 30, alpha = .6) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  facet_wrap(~ .metric, scales = "free") + 
+  labs(x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("temp/xgb_metrics_mult.png", width = 6, height = 6/1.6, dpi = 1000)
+
+# xgb_res_mult_metrics %>% 
+#   ggplot(aes(.estimate)) +
+#   geom_boxplot() +
+#   facet_wrap(~ .metric, scales = "free")
+```
+
+Table
+
+```{r}
+xgb_res_mult_metrics %>% 
+  group_by(.metric) %>% 
+  summarise(min(.estimate), mean(.estimate), median(.estimate), 
+            max(.estimate), sd(.estimate)) %>% 
+  write_xlsx("temp/xgb_metrics_mult.xlsx")
+```
+
+Single
+
+Plot
+```{r, fig.width = 6, fig.asp=1/1.6}
+# average performance metrics over datasets
+xgb_res_single_metrics <- 
+  lapply(1:length(xgb_res_single), function(x) {
+    xgb_res_single[[x]][["metrics"]] %>% 
+      select(.metric, .estimate) %>% 
+      mutate(sim_no = x)
+    }) %>% 
+  do.call("rbind", .) %>% 
+  as.data.table()
+
+saveRDS(xgb_res_single_metrics, "results/xgb_metrics_single.RDS")
+
+xgb_res_single_metrics %>% 
+  mutate(.metric = ifelse(.metric == "rmse", "RMSE", "R2")) %>% 
+  ggplot(aes(.estimate, fill = .metric)) +
+  geom_histogram(bins = 30, alpha = .6) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  facet_wrap(~ .metric, scales = "free") + 
+  labs(x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("temp/xgb_metrics_single.png", width = 6, height = 6/1.6, dpi = 1000)
+
+# xgb_res_single_metrics %>% 
+#   ggplot(aes(.estimate)) +
+#   geom_boxplot() +
+#   facet_wrap(~ .metric, scales = "free")
+```
+
+Table
+
+```{r}
+xgb_res_single_metrics %>% 
+  group_by(.metric) %>% 
+  summarise(min(.estimate), mean(.estimate), median(.estimate), 
+            max(.estimate), sd(.estimate)) %>% 
+  write_xlsx("temp/xgb_metrics_single.xlsx")
+```
+
+#### Variable importance
+
+Multi
+
+```{r, fig.width = 6, fig.asp=1/1.6}
+xgb_res_mult_vi <- 
+  lapply(1:length(xgb_res_mult), function(x) {
+    xgb_res_mult[[x]][["vimportance"]] %>% 
+      mutate(sim_no = x)
+    }) %>% 
+  do.call("rbind", .) %>% 
+  as.data.table()
+
+saveRDS(xgb_res_mult_vi, "results/xgb_vimportance_mult.RDS")
+
+xgb_res_mult_vi %>% 
+  mutate(Feature = case_when(Feature == "eigen" ~ "Eigenvector",
+                             Feature == "pagerank" ~ "PageRank",
+                             Feature == "degree" ~ "Degree")) %>% 
+  pivot_longer(Gain:Frequency, names_to = "metric", values_to = "value") %>% 
+  ggplot(aes(value, fill = Feature)) +
+  geom_histogram(bins = 50, alpha = .6) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  facet_grid(Feature ~ metric, scales = "free") +
+  labs(x = NULL, y = "Count") +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+ggsave("temp/xgb_vi_mult.png", width = 6, height = 6/1.6, dpi = 1000)
+```
+
+Single
+
+```{r, fig.width = 6, fig.asp=1/1.6}
+xgb_res_single_vi <- 
+  lapply(1:length(xgb_res_single), function(x) {
+    xgb_res_single[[x]][["vimportance"]] %>% 
+      mutate(sim_no = x)
+    }) %>% 
+  do.call("rbind", .) %>% 
+  as.data.table()
+
+saveRDS(xgb_res_single_vi, "results/xgb_vimportance_single.RDS")
+
+xgb_res_single_vi %>% 
+  mutate(Feature = case_when(Feature == "eigen" ~ "Eigenvector",
+                             Feature == "pagerank" ~ "PageRank",
+                             Feature == "degree" ~ "Degree")) %>% 
+  pivot_longer(Gain:Frequency, names_to = "metric", values_to = "value") %>% 
+  ggplot(aes(value, fill = Feature)) +
+  geom_histogram(bins = 50, alpha = .6) +
+  scale_fill_viridis_d(option = "plasma", end = 0.95) +
+  facet_grid(Feature ~ metric, scales = "free") +
+  labs(x = NULL, y = "Count") +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+ggsave("temp/xgb_vi_single.png", width = 6, height = 6/1.6, dpi = 1000)
+```
+
+#### Cox models -- no work
+
+```{r}
+# Multi-layer
+xgb_cox_mult <- lapply(1, function(x) {
+  print(paste0(x, ":", Sys.time(), " "))
+  
+  df <- data.table(tti[[x]]) %>% 
+  mutate(time = tti[[x]],
+         status = ifelse(is.na(.data$time), FALSE, TRUE)) %>%
+  mutate(time = ifelse(is.na(.data$time),
+                       max(.data$time, na.rm = TRUE), 
+                       .data$time),
+         deg_mult = deg_mult[,1],
+         eig_mult = eig_mult[,1],
+         pr_mult = pr_mult[,1]) %>% 
+  as.data.table() 
+    
+ xgb_pipeline(seed = x,
+              predictors = list("degree" = df$deg_mult, 
+                                "eigen" = df$eig_mult,
+                                "pagerank" = df$pr_mult),
+              outcome = list("tti" = cbind(df$status, df$time)),  
+              eval_metric = "cox-nloglik", 
+              objective = "survival:cox",
+              hyperparams = best_rmse, 
+              train_prop = 0.1)
+})
+
+xgb_cox_mult[[1]]$last_fit %>% 
+  #extract_fit_engine() %>% 
+  extract_fit_parsnip()
+  concordance()
+```
+
+
+### PCR test data
+
+Get and clean Covid test data
+
+```{r}
 covid_dat <- as.data.table(read_spss(path_rivm))
 
-# Reduce to first positive case per person
 positives_dat <- covid_dat %>% 
   lazy_dt(immutable = FALSE) %>% 
   # remove without bsn
   filter(RINPERSOONS == "R") %>% 
-  # add variables indicating time until infection
+  # add time variables
   mutate(DatumMonsterafname = as.Date(DatumMonsterafname),
          Testuitslag = Testuitslag != "NEGATIEF",
          time_afname = as_datetime(paste(DatumMonsterafname, TijdstipMonsterafname)),
-         days_from_start = difftime(DatumMonsterafname, min(DatumMonsterafname), 
-                                    units = "days"),
+         days_from_start = difftime(DatumMonsterafname, min(DatumMonsterafname), units = "days"),
          weeks_from_start = as.integer(ceiling(days_from_start/7))) %>% 
   # get only first positive result for every person
+  filter(Testuitslag == TRUE) %>% 
   group_by(RINPERSOON) %>% 
-  filter(isTRUE(Testuitslag) & time_afname == min(time_afname)) %>% 
+  arrange(time_afname) %>% 
+  slice_head(n = 1) %>% 
   ungroup() %>% 
   as.data.table()
 
 saveRDS(positives_dat, "data_processed/positive_cases.RDS")
 
-# Join time until infection with centrality measures
+# Join with centrality measures
 test_dat <- positives_dat %>% 
-  inner_join(data.frame(
-    deg_multtau, deg_mult, eig_mult, pr_mult, "RINPERSOON" = nodes)
-    ) %>% 
-  mutate(across(ends_with("from_start"), as.integer))
+  inner_join(data.frame(#deg_multtau, 
+                        deg_mult, eig_mult, pr_mult,
+                        deg_single, eig_single, pr_single,
+                        "RINPERSOON" = nodes)) %>% 
+  mutate(across(ends_with("from_start"), as.integer),
+         tti = weeks_from_start)
 ```
 
-Run linear regression models on Covid-test data.
+#### XGBoost
+
+##### Models from simulations
 
 ```{r}
-lin_models_taudegree_test <- lapply(formulas_taudegree, function(f) {
-  x <<- test_dat$weeks_from_start
-  r2 <- summary(lm(f, data = test_dat))$adj.r.squared
-  rmse <- sqrt(mean(lm(f, data = test_dat)$residuals^2))
-  
-  data.frame("r2" = r2, "rmse" = rmse)
+# Multi-layer
+pred_metrics_multi <- lapply(1:length(xgb_wfs_mult), function(x) {
+  test_dat %>% 
+    rename(degree = deg_mult,
+           eigen = eig_mult,
+           pagerank = pr_mult) %>%
+    predict(xgb_wfs_mult[[x]]$last_fit, new_data = .) %>% 
+    bind_cols(tti = test_dat$tti)
+}) %>% 
+  lapply(., function(x) {
+    x %>% 
+      metrics(tti, .pred)
   })
 
-do.call("rbind", lin_models_taudegree_test) %>% 
-  mutate(model = row_number()) %>% 
-  write_xlsx("results/lin_models_taudegree_test.xlsx")
+pred_metrics_multi__sum <- lapply(1:length(pred_metrics_multi), function(x) {
+  pred_metrics_multi[[x]] %>% 
+    mutate(sim_no = x)
+}) %>% 
+  do.call("rbind", .) %>% 
+  select(-.estimator)
+
+pred_metrics_multi_sum %>% 
+  ggplot(aes(.estimate, fill = .metric)) +
+  geom_histogram(bins = 50) +
+  facet_wrap(~ .metric)
+
+pred_metrics_multi_sum %>%
+  group_by(.metric) %>% 
+  summarise(mean(.estimate))
+
 ```
+
+```{r}
+# Single-layer
+pred_metrics_single <- lapply(1:length(xgb_wfs_single), function(x) {
+  test_dat %>%
+    rename(degree = deg_single,
+           eigen = eig_single,
+           pagerank = pr_single) %>%
+    predict(xgb_wfs_single[[x]]$last_fit, new_data = .) %>% 
+    bind_cols(tti = test_dat$tti)
+}) %>% 
+  lapply(., function(x) {
+    x %>% 
+      metrics(tti, .pred)
+  })
+
+pred_metrics_single_sum <- lapply(1:length(pred_metrics_single), function(x) {
+  pred_metrics_single[[x]] %>% 
+    mutate(sim_no = x)
+}) %>% 
+  do.call("rbind", .) %>% 
+  select(-.estimator)
+
+pred_metrics_single_sum %>% 
+  ggplot(aes(.estimate, fill = .metric)) +
+  geom_histogram(bins = 50) +
+  facet_wrap(~ .metric)
+
+pred_metrics_single_sum %>% 
+  group_by(.metric) %>% 
+  summarise(mean(.estimate))
+```
+
+##### Fit new models
+
+```{r}
+xgb_pcr_mult <- 
+  xgb_pipeline(seed = 9106,
+               predictors = list("degree" = test_dat$deg_mult, 
+                                 "eigen" = test_dat$eig_mult,
+                                 "pagerank" = test_dat$pr_mult),
+               outcome = list("tti" = test_dat$tti),  
+               eval_metric = "rmse", 
+               objective = "reg:squarederror",
+               hyperparams = best_rmse, 
+               train_prop = 0.6)
+
+```
+
+```{r}
+write_xlsx(list(metrics = xgb_pcr_mult$metrics,
+                vi = xgb_pcr_mult$vimportance),
+             "temp/xgb_pcr_mult_simple.xlsx")
+
+```
+
+```{r}
+xgb_pcr_single <- 
+  xgb_pipeline(seed = 9106,
+               predictors = list("degree" = test_dat$deg_single, 
+                                 "eigen" = test_dat$eig_single,
+                                 "pagerank" = test_dat$pr_single),
+               outcome = list("tti" = test_dat$tti),  
+               eval_metric = "rmse", 
+               objective = "reg:squarederror",
+               hyperparams = best_rmse, 
+               train_prop = 0.6)
+
+```
+
+```{r}
+write_xlsx(list(metrics = xgb_pcr_single$metrics,
+                vi = xgb_pcr_single$vimportance),
+             "temp/xgb_pcr_single_simple.xlsx")
+```
+
+##### Augment with age and location data
+
+Assemble data
+
+```{r}
+# Get person data
+person_dat <- fread(
+  "G:/Bevolking/GBAPERSOONTAB/2021/geconverteerde data/GBAPERSOON2021TABV1.csv", 
+  select = list("RINPERSOONS", 
+                character = "RINPERSOON",
+                integer = "GBAGEBOORTEMAAND",
+                integer = "GBAGEBOORTEJAAR",
+                "GBAHERKOMSTLAND"))
+
+# Subset to sample nodes
+person_sub <- person_dat %>% 
+  as.data.table() %>% 
+  semi_join(as.data.table(nodes), by = c("RINPERSOON" = "nodes"))
+
+saveRDS(person_sub, "data_processed/person_sub.RDS")
+rm(person_dat)
+```
+
+
+```{r}
+# Address data
+address_dat <- 
+  fread("G:/Bevolking/GBAADRESOBJECTBUS/geconverteerde data/GBAADRESOBJECT2021BUSV1.csv", 
+        select = list("RINPERSOONS", 
+                       character = "RINPERSOON",
+                       integer = "GBADATUMAANVANGADRESHOUDING",
+                       integer = "GBADATUMEINDEADRESHOUDING",
+                       "SOORTOBJECTNUMMER", "RINOBJECTNUMMER"))
+
+address_sub <- address_dat %>%
+  # subset to sample
+  semi_join(as.data.table(nodes), by = c("RINPERSOON" = "nodes")) %>% 
+  # get last address per person
+  group_by(RINPERSOON) %>% 
+  arrange(GBADATUMAANVANGADRESHOUDING) %>% 
+  slice_tail(n = 1) %>% 
+  ungroup()
+
+saveRDS(address_sub, "data_processed/address_sub.RDS")
+rm(address_dat)
+
+# Postcodes
+postcode_dat <- read_sav("G:/BouwenWonen/VSLPOSTCODEBUS/VSLPOSTCODEBUSV2023031.sav")
+
+# takes ~30mins
+postcode_sub <- postcode_dat %>% 
+  zap_labels() %>% 
+  as.data.table() %>%
+  mutate(DATUMAANVPOSTCODENUMADRES = as.integer(DATUMAANVPOSTCODENUMADRES)) %>% 
+  group_by(RINOBJECTNUMMER, SOORTOBJECTNUMMER) %>% 
+  arrange(DATUMAANVPOSTCODENUMADRES) %>% 
+  slice_tail(n = 1) %>% 
+  ungroup() %>% 
+  right_join(address_sub)
+
+saveRDS(postcode_sub, "data_processed/postcode_sub.RDS")
+rm(postcode_dat)
+```
+
+
+```{r}
+# Add extra variables to test data
+extra_dat <- test_dat %>% 
+  left_join(person_sub) %>% 
+  left_join(postcode_sub[,c("RINPERSOONS", "RINPERSOON", "POSTCODENUM")]) %>% 
+  mutate(postcode2 = str_sub(POSTCODENUM, 1, 2),
+         dutch = as.integer(GBAHERKOMSTLAND == "6030"))
+
+saveRDS(extra_dat, "data_processed/extra_dat.RDS")
+```
+
+Summary stats
+
+```{r}
+extra_dat %>% 
+  select(weeks_from_start, GBAGEBOORTEJAAR, dutch,
+         deg_single, eig_single, eig_mult, pr_single, pr_mult) %>% 
+  mutate(age_2020 = 2020 - GBAGEBOORTEJAAR) %>% 
+  summarize(across(everything(), list(
+    #.min = ~min(.x),
+    #.min_n = ~sum(.x == min(.x)),
+    .pct25 = ~quantile(.x, probs = .25),
+    .pct25_n = ~sum(.x == quantile(.x, probs = .25)),
+    .mean = ~mean(.x),
+    .median = ~median(.x),
+    .median_n = ~sum(.x == median(.x)),
+    .pct75 = ~quantile(.x, probs = .75),
+    .pct75_n = ~sum(.x == quantile(.x, probs = .75)),
+    #.max = ~max(.x),
+    #.max_n = ~sum(.x == max(.x)),
+    .sd = ~sd(.x)))) %>% 
+  pivot_longer(everything(), names_sep = "_\\.", 
+               names_to = c("variable", "statistic")) %>% 
+  filter(!(str_detect(statistic, "_n") & variable %in% c("weeks_from_start", "dutch")),
+         !(variable == "dutch" & statistic != "mean")) %>% 
+  # flag and remove cells <= 10 individuals
+  mutate(flag = (str_detect(statistic, "_n") & value <= 10)) %>% 
+  filter(lead(flag) == FALSE & flag == FALSE) %>% 
+  select(-flag) %>% 
+  write_xlsx("temp/descriptives_pcr.xlsx")
+```
+
+Cumulative infection curve by age group
+
+```{r}
+cumsum_positives_all <- extra_dat %>% 
+  group_by(DatumMonsterafname) %>% 
+  summarise(sum_positives_all = n()) %>% 
+  ungroup() %>%
+  arrange(DatumMonsterafname) %>% 
+  mutate(sum_positives_all = cumsum(sum_positives_all))
+
+age_bins <- c(2, 12, 18, seq(30, 70, 10), 89)
+  
+age_groups <- extra_dat %>% 
+  mutate(age = 2020 - GBAGEBOORTEJAAR,
+         age_group = cut(age, age_bins, include.lowest = TRUE)) %>%
+  group_by(age_group) %>%
+  summarise(n_age = n()) %>%
+  ungroup()
+
+cumsum_positives <- extra_dat %>% 
+  mutate(age = 2020 - GBAGEBOORTEJAAR,
+         age_group = cut(age, age_bins, include.lowest = TRUE)) %>% 
+  group_by(age_group, DatumMonsterafname) %>% 
+  summarise(sum_positives_age = n()) %>% 
+  ungroup() %>% 
+  group_by(age_group) %>% 
+  arrange(DatumMonsterafname) %>% 
+  mutate(sum_positives_age = cumsum(sum_positives_age)) %>% 
+  ungroup() %>% 
+  arrange(age_group, DatumMonsterafname) %>% 
+  left_join(cumsum_positives_all) %>% 
+  left_join(age_groups) %>% 
+  mutate(share_positives = sum_positives_age/n_age)
+
+cumsum_positives %>% 
+  group_by(age_group) %>% 
+  arrange(DatumMonsterafname) %>% 
+  slice_tail(n = 1) %>% 
+  ungroup() %>% 
+  summarise(sum(sum_positives_age))
+```
+
+Plots 
+
+```{r, fig.width=7, fig.asp=1/1.6}
+cumsum_positives %>% 
+  ggplot() +
+  geom_line(aes(DatumMonsterafname, sum_positives_age, 
+                color = as.ordered(age_group), group = age_group),
+            linewidth = 0.7) +
+  scale_color_viridis_d(option = "plasma") +
+  labs(y = "Number of positive tests in age group (cumulative)", x = NULL,
+       color = "Age group") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+ggsave("temp/pcr_byage_sum.pdf", width = 7, height = 7/1.6)
+ggsave("temp/pcr_byage_sum.png", width = 7, height = 7/1.6, dpi = 1000)
+```
+
+
+```{r, fig.width=7, fig.asp=1/1.6}
+cumsum_positives %>% 
+  ggplot() +
+  geom_line(aes(DatumMonsterafname, share_positives, 
+                color = as.ordered(age_group), group = age_group),
+            linewidth = 0.7) +
+  scale_color_viridis_d(option = "plasma") +
+  labs(y = "Share of positive tests in age group (cumulative)", x = NULL,
+       color = "Age group") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+ggsave("temp/pcr_byage.pdf", width = 7, height = 7/1.6)
+ggsave("temp/pcr_byage.png", width = 7, height = 7/1.6, dpi = 1000)
+```
+
+```{r, fig.width=7, fig.asp=1/1.6}
+extra_dat %>% 
+  mutate(age = 2020 - GBAGEBOORTEJAAR,
+         age_group = cut(age, age_bins, include.lowest = TRUE)) %>% 
+  ggplot(aes(weeks_from_start, fill = as.ordered(age_group), group = age_group)) +
+  geom_histogram(stat = "density", adjust = 1/3) + 
+  scale_fill_viridis_d(option = "plasma") +
+  facet_wrap(~ age_group, scales = "free_y") +
+  labs(x = "Weeks until first positive test", y = "Density of positive tests") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("temp/tti_byage.pdf", width = 7, height = 7/1.6)
+ggsave("temp/tti_byage.png", width = 7, height = 7/1.6, dpi = 1000)
+```
+
+Run models
+
+```{r}
+xgb_pcr_mult_aug <- 
+  xgb_pipeline(seed = 9106,
+               predictors = list("degree" = extra_dat$deg_mult, 
+                                 "eigen" = extra_dat$eig_mult,
+                                 "pagerank" = extra_dat$pr_mult,
+                                 "age" = extra_dat$GBAGEBOORTEJAAR,
+                                 "postcode" = extra_dat$postcode2,
+                                 "dutch" = extra_dat$dutch),
+               outcome = list("tti" = extra_dat$tti),  
+               eval_metric = "rmse", 
+               objective = "reg:squarederror",
+               hyperparams = best_rmse, 
+               train_prop = 0.6)
+
+xgb_pcr_single_aug <- 
+  xgb_pipeline(seed = 9106,
+               predictors = list("degree" = extra_dat$deg_single, 
+                                 "eigen" = extra_dat$eig_single,
+                                 "pagerank" = extra_dat$pr_single,
+                                 "age" = extra_dat$GBAGEBOORTEJAAR,
+                                 "postcode" = extra_dat$postcode2,
+                                 "dutch" = extra_dat$dutch),
+               outcome = list("tti" = extra_dat$tti),  
+               eval_metric = "rmse", 
+               objective = "reg:squarederror",
+               hyperparams = best_rmse, 
+               train_prop = 0.6)
+```
+
+```{r}
+write_xlsx(list(metrics = xgb_pcr_mult_aug$metrics,
+                vi = xgb_pcr_mult_aug$vimportance),
+             "temp/xgb_pcr_mult_aug.xlsx")
+
+write_xlsx(list(metrics = xgb_pcr_single_aug$metrics,
+                vi = xgb_pcr_single_aug$vimportance),
+             "temp/xgb_pcr_single_aug.xlsx")
+```
+
+# Eigenvector - PageRank correlation 
+
+Simulated networks showed that when cluster distribution is very skewed and clusters are not well connected, EC and PC are basically uncorrelated. EC becomes bi-modal around 0 an 1.
+
+### Component/Cluster distributions
+
+- in aggregate inspect k-coreness
+- in individual layers inspect component size distribution and k-coreness
+
+```{r}
+core_all <- coreness(g_all)
+```
+
+```{r, fig.width=6, fig.asp=1/1.6}
+ggplot(data.frame(core_all), aes(core_all, fill = "kcore")) +
+  geom_density(alpha = .6, adjust = 1/3,
+               position = "identity", color = "transparent") +
+  scale_fill_viridis_d(option = "plasma", end = .95) +
+  labs(x = "k-coreness", y = "Density", 
+       caption = "Note: k-coreness > 100 for 1755 nodes.") +
+  theme_minimal() +
+  theme(plot.caption = element_text(hjust = 0.01), 
+        plot.caption.position = "plot",
+        legend.position = "none")
+
+ggsave("temp/kcoreness.pdf", width = 6, height = 7/1.6)
+ggsave("temp/kcoreness.png", width = 6, height = 7/1.6, dpi = 1000)
+```
+
+
+```{r}
+summary(core_all)
+hist(core_all, breaks = 1000)
+hist(core_all[core_all > 1], breaks = 1000)
+hist(core_all[core_all < 100], breaks = 1000)
+```
+
+# Session info
+
+```{r}
+write_lines(capture.output(print(sessionInfo(), RNG = TRUE)), "temp/session.txt")
+```
+
+
+
+
+
+
+
+
+
+
 
 

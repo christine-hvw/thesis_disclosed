@@ -1,82 +1,49 @@
-R version 4.1.3 (2022-03-10)
-Platform: ×86_64-w64-mingw32/×64 (64-bit)
-Running under: Windows 10 ×64 (build 22000)
+R version 4.2.3 (2023-03-15 ucrt)
+Platform: x86_64-w64-mingw32/x64 (64-bit)
+Running under: Windows 10 x64 (build 22000)
 
 Matrix products: default
 
+Random number generation:
+ RNG:     Mersenne-Twister 
+ Normal:  Inversion 
+ Sample:  Rejection 
+ 
 locale:
-[1] LC_COLLATE=Dutch_Netherlands. 1252
-[2] LC_CTYPE-Dutch_Netherlands. 1252
-[3] LC_MONETARY-Dutch_Netherlands. 1252
-[4] LC NUMERIC=C
-[5] LC_TIME-Dutch_Nether lands. 1252 
+[1] LC_COLLATE=Dutch_Netherlands.utf8  LC_CTYPE=Dutch_Netherlands.utf8   
+[3] LC_MONETARY=Dutch_Netherlands.utf8 LC_NUMERIC=C                      
+[5] LC_TIME=Dutch_Netherlands.utf8    
 
 attached base packages:
-[1] stats graphics grDevices
-[4] utils datasets methods
-[7] base
- 
+[1] parallel  stats     graphics  grDevices utils     datasets  methods   base     
+
 other attached packages:
- [1] survival_3.3-1
- [2] writexl_1.4.0
- [3] igraph_1.3.0
- [4] Matrix_1.4-1
- [5] muxViz_3.1
- [6] lubridate_1.9.2
- [7] forcats_1.0.0
- [8] stringr_1.5-0
- [9] dplyr_1.1.1
-[10] purrr_1.0.1
-[11] readr_2.1.4
-[12] tidyr_1.3.0
-[13] tibble_ 3.2.1
-[14] ggplot2_3.4.2
-[15] tidyverse_2.0.0
-[16] dtplyr_1.3.1
-[17] data.table 1.14.2
-[18] haven_2.5.2
+ [1] xgboost_1.7.5.1    doParallel_1.0.17  iterators_1.0.14   foreach_1.5.2      vip_0.3.2         
+ [6] yardstick_1.2.0    workflowsets_1.0.1 workflows_1.1.3    tune_1.1.1         rsample_1.1.1     
+[11] recipes_1.0.6      parsnip_1.1.0      modeldata_1.1.0    infer_1.0.4        dials_1.2.0       
+[16] broom_1.0.5        tidymodels_1.1.0   survival_3.5-5     writexl_1.4.2      patchwork_1.1.2   
+[21] igraph_1.5.0       Matrix_1.5-4.1     muxViz_3.1         scales_1.2.1       lubridate_1.9.2   
+[26] forcats_1.0.0      stringr_1.5.0      dplyr_1.1.2        purrr_1.0.1        readr_2.1.4       
+[31] tidyr_1.3.0        tibble_3.2.1       ggplot2_3.4.2      tidyverse_2.0.0    dtplyr_1.3.1      
+[36] data.table_1.14.8  haven_2.5.2       
 
 loaded via a namespace (and not attached):
- [1] pillar_1.9.0
- [2] compiler_4.1.3
- [3] tools_4.1.3
- [4] extrafont_0.18
- [5] digest_0.6.29
- [6] lattice_0.20-45
- [7] memoise_2.0.1
- [8] jsonlite_1.8.4
- [9] lifecycle_1.0.3
-[10] gtable_0.3.0
-[11] timechange_0.2.0
-[12] pkgconfig_2.0.3
-[13] rlang_1.1.0
-[14] cli_3.6.1
-[15] rstudioapi_0.14
-[16] pkgdown_1.6.1
-[17] xfun_0.30
-[18] fastmap_1.1.0
-[19] Rttf2pt1_1.3.10
-[20] withr_2.5.0
-[21] knitr_1.38
-[22] fs_1.5.2
-[23] htmlwidgets_1.5.4
-[24] generics_0.1.2
-[25] vctrs_0.6.1
-[26] hms_1.1.3
-[27] grid_4.1.3
-[28] tidyselect_1.2.0
-[29] glue_1.6.2
-[30] R6_2.5.1
-[31] fansi_1.0.3
-[32] rgl_0.108.3
-[33] extrafontdb_1.0
-[34] tzdb_0.3.0
-[35] magrittr_2.0.3
-[36] splines_4.1.3
-[37] htmltools_0.5.2
-[38] scales_1.2.0
-[39] colorspace_2.0-3
-[40] utf8_1.2.2
-[41] stringi_1.7.6
-[42] munsell_0.5.0
-[43] hem_1.0.6
+ [1] colorspace_2.1-0    slider_0.3.0        class_7.3-22        base64enc_0.1-3    
+ [5] rstudioapi_0.14     listenv_0.9.0       furrr_0.3.1         farver_2.1.1       
+ [9] prodlim_2023.03.31  fansi_1.0.4         codetools_0.2-19    splines_4.2.3      
+[13] extrafont_0.19      knitr_1.43          jsonlite_1.8.5      Rttf2pt1_1.3.12    
+[17] compiler_4.2.3      backports_1.4.1     fastmap_1.1.1       cli_3.6.1          
+[21] htmltools_0.5.5     tools_4.2.3         gtable_0.3.3        glue_1.6.2         
+[25] Rcpp_1.0.11         DiceDesign_1.9      vctrs_0.6.3         extrafontdb_1.0    
+[29] timeDate_4022.108   gower_1.0.1         xfun_0.39           modelenv_0.1.1     
+[33] globals_0.16.2      timechange_0.2.0    lifecycle_1.0.3     future_1.33.0      
+[37] MASS_7.3-60         ipred_0.9-14        ragg_1.2.5          hms_1.1.3          
+[41] yaml_2.3.7          gridExtra_2.3       rpart_4.1.19        stringi_1.7.12     
+[45] lhs_1.1.6           hardhat_1.3.0       warp_0.2.0          lava_1.7.2.1       
+[49] rlang_1.1.1         pkgconfig_2.0.3     systemfonts_1.0.4   rgl_1.1.3          
+[53] evaluate_0.21       lattice_0.21-8      htmlwidgets_1.6.2   labeling_0.4.2     
+[57] tidyselect_1.2.0    parallelly_1.36.0   magrittr_2.0.3      R6_2.5.1           
+[61] generics_0.1.3      pillar_1.9.0        withr_2.5.0         nnet_7.3-19        
+[65] future.apply_1.11.0 utf8_1.2.3          tzdb_0.4.0          rmarkdown_2.22     
+[69] grid_4.2.3          digest_0.6.33       textshaping_0.3.6   GPfit_1.0-8        
+[73] munsell_0.5.0       viridisLite_0.4.2  
